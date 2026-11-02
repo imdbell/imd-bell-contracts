@@ -13,7 +13,6 @@ import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {FullMath} from "v4-core/src/libraries/FullMath.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "v4-core/src/types/BeforeSwapDelta.sol";
-import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {BellGame} from "./BellGame.sol";
 import {SwarmBudget, IERC20B} from "./SwarmBudget.sol";
 import {IIntake} from "./IIntake.sol";
@@ -78,6 +77,7 @@ contract MarketHoursHook is IUnlockCallback {
     error RoundTrip();
     error TransferFailed();
     error SharesNotWhole();
+    error PoolUnlocked();
 
     // ── schedule (UTC seconds into the day) ──
     uint256 internal constant OPEN_BELL = 43200;
@@ -102,9 +102,19 @@ contract MarketHoursHook is IUnlockCallback {
     uint256 internal constant MIN_BURN = 5e18;
     /// @dev The smallest coin burn, so each burn is worth its gas.
     uint256 internal constant MIN_COIN_BURN = 100_000e18;
-    /// @dev About twice the largest full-band bell measured (3,264,965 on a launched hook with the coin above IMD), with
-    ///      about 7 % headroom, so a bell is never started with too little gas to finish, whatever the book's composition.
-    uint256 public constant BELL_GAS_FLOOR = 7_000_000;
+    /// @dev The band's worst residual plus at least 15 %: a pool with a position at every bucket, and a residual that
+    ///      crosses the most the cap allows (RESIDUAL_MAX_BUCKETS: 120 initialised ticks never crossed before, with fee
+    ///      growth in both tokens), needs 9,176,237 gas to ring and fill (the sell residual down, measured cold); x 1.15
+    ///      is 10,552,673, rounded up to the next 100,000. Below it a bell is refused; above it a residual that still runs
+    ///      out of gas (a pool spot outside the band) reverts the bell, never drops the residual.
+    uint256 public constant BELL_GAS_FLOOR = 10_600_000;
+    /// @dev The most a bell's residual may move the pool, in buckets from the pool's own price at the ring, in the
+    ///      residual's direction. It bounds the initialised ticks a residual can cross (one per bucket at most), so no
+    ///      set of planted dust positions can make a bell need more gas than one transaction may carry.
+    uint256 internal constant RESIDUAL_MAX_BUCKETS = 120;
+    /// @dev The cap as divisors of the pool's sqrt price in Q192: R = sqrt(1.0001)^(RESIDUAL_MAX_BUCKETS * 60) in Q96
+    ///      (TickMath.getSqrtPriceAtTick(7_200)) takes the price down by the cap, 2^192 / R (rounded down) up by it.
+    uint256 internal constant CAP_DOWN = 113_558_011_866_913_733_348_073_426_848;
     uint256 internal constant CAP0 = 1_000e18;
     uint256 internal constant CAP_MAX = 100_000e18;
     /// @dev Of harvested IMD, the swarm's slice (the bell purse takes its own bps too, the rest burns); of harvested
@@ -114,6 +124,11 @@ contract MarketHoursHook is IUnlockCallback {
 
     uint256 internal constant ONE = 1e18;
     uint256 internal constant Q96 = 0x1000000000000000000000000;
+    /// @dev sqrt(1 - FEE) in Q96, rounded down: floor(sqrt(((1_000_000 - 12_500) << 192) / 1_000_000)). A constant
+    ///      rather than computed per residual (Math.sqrt is ~260 B of code the bucket cap needs): the pool's fee can never
+    ///      differ from FEE, because beforeInitialize accepts only the pool whose id is _key()'s, and _key() is built
+    ///      with FEE, a static fee (no dynamic-fee flag). test_H_feeRootIsTheSqrtOfTheFee checks the figure.
+    uint256 internal constant FEE_ROOT_Q96 = 78_731_429_325_869_267_202_663_517_946;
     // transient-storage slots: the reentrancy guard, and the flag that admits unlockCallback
     uint256 internal constant LOCK_SLOT = 0x6d682e6c6f636b;
     uint256 internal constant UNLOCK_SLOT = 0x6d682e756e6c6f636b;
@@ -188,7 +203,8 @@ contract MarketHoursHook is IUnlockCallback {
 
     /// @dev The charge side of a bell's ratios. `Bell` keeps the payout ratios, rounded down; a charge uses the same
     ///      ratio rounded up: `roundUp` bit 0 / bit 1 say the inner / marginal fill had a remainder (so its ceiling is
-    ///      one more), and `residualUp` is the residual's charge ratio, rounded up.
+    ///      one more), bit 2 that the residual stopped at RESIDUAL_MAX_BUCKETS, and `residualUp` is the residual's charge
+    ///      ratio, rounded up.
     struct Charge {
         uint8 roundUp;
         uint64 residualUp;
@@ -229,12 +245,17 @@ contract MarketHoursHook is IUnlockCallback {
     event BellPursePaid(uint256 sent);
 
     bool public initialized;
+    /// @notice The reference of the book open for entry (see referenceOf). The name is kept from when it was the last
+    ///         clearing price; it is now the pool's own price, set at initialisation and by each bell before its residual.
     int24 public lastCleared;
     uint256 public nextOrderId;
     mapping(uint256 => Order) public orders;
     mapping(uint256 => mapping(int24 => uint256)) public buyImd;
     mapping(uint256 => mapping(int24 => uint256)) public sellTok;
+    /// @notice Per book, the orders' counted amounts (IMD weighted by distance from the reference) against the cap.
     mapping(uint256 => uint256) public bookImdTotal;
+    /// @dev What each order counted toward its book's cap when placed; a cancel takes back exactly this.
+    mapping(uint256 => uint256) internal countedOf;
     mapping(uint256 => Bell) public bells;
     mapping(uint256 => Charge) public charges;
     Checkpoint public checkpoint;
@@ -258,7 +279,12 @@ contract MarketHoursHook is IUnlockCallback {
     uint256 public reserveCoin;
 
     constructor(Params memory p) {
-        if (uint256(p.networkBps) + p.feeWalletBps + p.swarmFeeBps + p.burnBps + p.bellPurseBps != 10_000) {
+        // the purse also takes bellPurseBps of harvested IMD beside the swarm's slice, so those two may not pass the whole
+        // (else harvest() underflows on any inflow)
+        if (
+            uint256(p.networkBps) + p.feeWalletBps + p.swarmFeeBps + p.burnBps + p.bellPurseBps != 10_000
+                || SWARM_BPS + p.bellPurseBps > 10_000
+        ) {
             revert SharesNotWhole();
         }
         manager = p.manager;
@@ -301,11 +327,19 @@ contract MarketHoursHook is IUnlockCallback {
         returns (uint256 orderId)
     {
         if (!_enterable(s)) revert NotEnterable();
-        int24 ref = referenceOf(s);
+        int24 ref = lastCleared;
         if (bucket % TS != 0 || bucket > ref + BAND * TS || bucket < ref - BAND * TS) revert BadBucket();
         uint256 imdValue = buy ? amount : _coinToImd(amount, _sqrtAt(ref));
         if (imdValue < MIN_ORDER) revert BelowMinOrder();
-        uint256 total = bookImdTotal[s] + imdValue;
+        // the cap counts an order by its distance from the reference: in full at it, falling linearly to a tenth at the
+        // band's edge, (40,000 - 3 x |bucket - ref|) / 40,000 with the distance in ticks (12,000 at the edge), so one far
+        // order that will not trade cannot fill the book
+        uint256 counted;
+        unchecked {
+            // |bucket - ref| <= 12,000 after the band check: no wrap
+            counted = imdValue * (40_000 - 3 * uint256(int256(bucket > ref ? bucket - ref : ref - bucket))) / 40_000;
+        }
+        uint256 total = bookImdTotal[s] + counted;
         if (total > depositCap()) revert BookFull();
         bookImdTotal[s] = total;
         _pull(buy ? imd : coin, amount);
@@ -316,6 +350,7 @@ contract MarketHoursHook is IUnlockCallback {
         else sellTok[s][bucket] += amount;
         orderId = nextOrderId++;
         orders[orderId] = Order(msg.sender, uint40(s), buy, false, false, bucket, amount);
+        countedOf[orderId] = counted;
         emit OrderPlaced(orderId, msg.sender, s, buy, bucket, amount);
     }
 
@@ -327,7 +362,7 @@ contract MarketHoursHook is IUnlockCallback {
         o.cancelled = true;
         uint256 a = o.amount;
         uint256 fee = _divUp(a * CANCEL_FEE_BPS, 10_000);
-        bookImdTotal[o.s] -= o.buy ? a : _coinToImd(a, _sqrtAt(referenceOf(o.s)));
+        bookImdTotal[o.s] -= countedOf[orderId]; // exactly what the order counted when placed, never re-valued
         if (o.buy) {
             buyImd[o.s][o.bucket] -= _net(a);
             burnAccrued += fee;
@@ -370,18 +405,19 @@ contract MarketHoursHook is IUnlockCallback {
     ///      order pays the cancel fee, rounded up, in its own currency: all of an order the bell did not reach, and what
     ///      neither the book nor the pool filled of one it did reach (a one-sided or zero-match book included). The one
     ///      exception is the marginal bucket's pro-rata remainder: an order at P* on the heavier side, when the book
-    ///      rationed that bucket (a marginal fill above zero), gets its remainder back whole. The fee's base is the
+    ///      rationed that bucket (a marginal fill above zero), gets its remainder back whole; so does every reached order
+    ///      on the heavier side when the residual stopped at RESIDUAL_MAX_BUCKETS. The fee's base is the
     ///      unfilled share of the escrow, so an order that filled nothing pays on all of it, bell-fee headroom included.
     function _outcome(Order memory o)
         internal
         view
-        returns (uint256 out, uint256 refund, uint256 fee, uint256 unfilledFee, uint256 filledImd)
+        returns (uint256 out, uint256 refund, uint256 fee, uint256 unfilledFee, bool paid)
     {
         uint256 s = o.s;
         Bell memory bl = bells[s];
         uint256 a = o.amount;
         refund = a;
-        if (!bl.rung) return (0, a, 0, 0, 0);
+        if (!bl.rung) return (0, a, 0, 0, false);
         if (o.buy ? o.bucket >= bl.pStar : o.bucket <= bl.pStar) {
             uint160 sp = _sqrtAt(bl.pStar);
             bool rationed; // the marginal bucket's pro-rata remainder, exempt from the unfilled-order fee
@@ -393,10 +429,13 @@ contract MarketHoursHook is IUnlockCallback {
             uint256 bookOut = net;
             uint256 resIn;
             uint256 resOut;
+            uint256 filledImd;
             if (o.buy == bl.buyHeavy) {
                 Charge memory ch = charges[s];
                 bool marg = o.bucket == bl.pStar;
-                rationed = marg && bl.marginalFill > 0;
+                // the book rationed this order: the marginal bucket pro rata, or every inner order when the book filled
+                // them only in part (an inner fill above zero and below one); either way its remainder comes back whole
+                rationed = (marg ? bl.marginalFill > 0 : bl.innerFill > 0 && bl.innerFill < ONE) || ch.roundUp > 3;
                 uint256 f = marg ? bl.marginalFill : bl.innerFill;
                 bookIn = FullMath.mulDivRoundingUp(net, f + ((ch.roundUp >> (marg ? 1 : 0)) & 1), ONE);
                 bookOut = net * f / ONE;
@@ -426,9 +465,14 @@ contract MarketHoursHook is IUnlockCallback {
                 if (unfilledFee > refund) unfilledFee = refund;
                 refund -= unfilledFee;
             }
+            // the ticket: paid by the unfilled-order fee, by a fill of at least the smallest order, or by filling whole
+            // whatever the order's size (a buy's whole fill is its net, below MIN_ORDER for the smallest buys); a buy
+            // and a sell alike
+            paid = unfilledFee > 0 || filledImd >= MIN_ORDER || bookIn + resIn >= net;
         } else {
             unfilledFee = _divUp(a * CANCEL_FEE_BPS, 10_000);
             refund = a - unfilledFee;
+            paid = true; // the unfilled-order fee
         }
     }
 
@@ -471,8 +515,10 @@ contract MarketHoursHook is IUnlockCallback {
         return (r.p, r.matched, r.sCum > d, r.sCum > d ? r.sCum - d : d - r.sCum);
     }
 
-    function referenceOf(uint256 s) public view returns (int24) {
-        if (s & 1 == 1 && bells[s - 1].rung) return bells[s - 1].pStar;
+    /// @notice The reference of the book open for entry, the band's centre: the pool's own price at the bell that opened
+    ///         the book's entry window (at initialisation for the first book), fixed for the whole window; never a
+    ///         clearing price, so a self-matched pair can move one bell's P* inside the band but never the next band.
+    function referenceOf(uint256) public view returns (int24) {
         return lastCleared;
     }
 
@@ -487,15 +533,15 @@ contract MarketHoursHook is IUnlockCallback {
     }
 
     /// @notice Whether `orderId` paid for its guess ticket: it was cancelled (and paid the cancel fee), or its bell rang
-    ///         and it either filled at least the smallest order's worth in IMD or its bucket was not reached (its claim
-    ///         charges the unfilled-order fee, whenever it is made). Read from the order and its bell, never from
+    ///         and it filled whole (whatever its size), filled at least the smallest order's worth in IMD, or its claim
+    ///         charges the unfilled-order fee (whenever it is made). Read from the order and its bell, never from
     ///         whether the claim has happened yet.
     function ticketPaid(uint256 orderId) external view returns (bool) {
         Order memory o = orders[orderId];
         if (o.cancelled) return true;
         if (!bells[o.s].rung) return false;
-        (,,, uint256 unfilledFee, uint256 filledImd) = _outcome(o);
-        return unfilledFee > 0 || filledImd >= MIN_ORDER;
+        (,,,, bool paid) = _outcome(o);
+        return paid;
     }
 
     /// @notice Today's settle window: the frozen counters once a checkpoint has frozen them, the live counters until
@@ -521,6 +567,7 @@ contract MarketHoursHook is IUnlockCallback {
         uint256 bCum; // buys with limit >= p, IMD
         uint256 sellAt; // sells at exactly p, coin
         uint256 buyAt; // buys at exactly p, IMD
+        int24 a; // the pool's own price as a bucket, read before any residual: the next book's reference
     }
 
     function _scan(uint256 s) internal view returns (Scan memory r) {
@@ -555,14 +602,28 @@ contract MarketHoursHook is IUnlockCallback {
                 (best, bestImb, bestDist, bi) = (m, imb, dist, i);
             }
         }
-        if (best == 0) {
-            bi = uint256(uint24(BAND)); // zero matches: the reference bucket, unless the session traded
+        {
+            // the pool's own price, from what the breaker already keeps: the session's checkpoint mean when the session
+            // traded (one sample per block, so no one block moves it far), else the last checkpoint's price (the start of
+            // the last block that traded through the pool; the hook's own exits and residuals never set it), else, with
+            // no checkpoint ever, the reference as it stands
             Checkpoint memory cp = checkpoint;
-            if (cp.tickCount > 0) {
-                int256 mean = int256(cp.tickSum) / int256(uint256(cp.tickCount));
-                int256 j = (int256(_nearestBucket(imdIs0 ? -mean : mean)) - int256(lo)) / 60;
-                bi = j < 0 ? 0 : j >= int256(n) ? n - 1 : uint256(j);
+            r.a = lastCleared;
+            if (cp.tickCount > 0 || cp.sqrtPriceX96 != 0) {
+                int256 t = cp.tickCount > 0
+                    ? int256(cp.tickSum) / int256(uint256(cp.tickCount))
+                    : int256(TickMath.getTickAtSqrtPrice(cp.sqrtPriceX96));
+                // held where its whole band is a valid price (the grid's last bucket is 887,220), so the next book and its
+                // bell can always be priced
+                if (t > 875_220) t = 875_220;
+                if (t < -875_220) t = -875_220;
+                r.a = _nearestBucket(imdIs0 ? -t : t);
             }
+        }
+        if (best == 0) {
+            // zero matches: the pool's own price, held inside the band
+            int256 j = (int256(r.a) - int256(lo)) / 60;
+            bi = j < 0 ? 0 : j >= int256(n) ? n - 1 : uint256(j);
         }
         r.p = lo + int24(int256(bi)) * TS;
         r.matched = best;
@@ -572,10 +633,18 @@ contract MarketHoursHook is IUnlockCallback {
         r.buyAt = B[bi] - (bi + 1 < n ? B[bi + 1] : 0);
     }
 
-    /// @dev One code path for both bells. The cross is plain code; only the residual swap sits in a `try`.
+    /// @dev One code path for both bells. The cross is plain code; the residual swap runs in the hook's own unlock, and
+    ///      only the pool's own refusal inside it (see unlockCallback) leaves a residual unfilled: any other failure, out
+    ///      of gas included, reverts the bell, so a bell never goes final with its residual dropped.
     function _ring(uint256 s) internal {
         Bell storage bl = bells[s];
         if (bl.rung) revert BellAlreadyRung();
+        // rung from inside somebody else's unlock, a bell could not run its residual, and a swap after it in that same
+        // unlock would trade before the residual: refused, residual or not. exttload(bytes32) of the manager's own lock
+        // flag (v4's Lock.IS_UNLOCKED_SLOT).
+        if (_managerWord(0xf135baaa, 0xc090fc4683624cfc3884e9d8de5eca132f2d0ec062aff75d43c0465d5ceeab23) != 0) {
+            revert PoolUnlocked();
+        }
         if (gasleft() < BELL_GAS_FLOOR) revert GasFloor();
         Scan memory r = _scan(s);
         uint160 sp = _sqrtAt(r.p);
@@ -597,15 +666,18 @@ contract MarketHoursHook is IUnlockCallback {
         bl.buyHeavy = buyHeavy;
         bl.innerFill = inner;
         bl.marginalFill = marg;
-        lastCleared = r.p;
+        lastCleared = r.a; // the next book's reference: the pool's own price, never this bell's P*
         _windowAtBell(s);
         (checkpoint.tickSum, checkpoint.tickCount) = (0, 0);
         uint256 filled;
         if (resIn > 0) {
             // the heavier side's remainder through the curve, never past price(P*) with the pool's fee included
             _tset(UNLOCK_SLOT, 1);
-            try manager.unlock(abi.encode(buyHeavy, resIn, true, r.p)) returns (bytes memory ret) {
-                (uint256 spent, uint256 got) = abi.decode(ret, (uint256, uint256));
+            // no `try` here: an unlock that fails (a manager already unlocked, a failed settle, too little gas) reverts the
+            // bell instead of finalising it with its residual dropped; the pool's own refusal comes back as (0, 0)
+            (uint256 spent, uint256 got) =
+                abi.decode(manager.unlock(abi.encode(buyHeavy, resIn, true, r.p)), (uint256, uint256));
+            {
                 // `pay` is the payout base in the rationed side's own currency, `charge` the charge base
                 uint256 pay;
                 uint256 charge;
@@ -625,7 +697,11 @@ contract MarketHoursHook is IUnlockCallback {
                 }
                 bl.residualFill = uint64(pay * ONE / resIn); // payout ratio: rounds down
                 ch.residualUp = uint64(FullMath.mulDivRoundingUp(charge, ONE, resIn)); // charge ratio: rounds up
-            } catch {}
+            }
+            // bit 2: the hook's own bucket cap was the residual's nearer limit, so what it left unfilled is the cap's
+            // doing, not the market's, and comes back without the unfilled-order fee (see _outcome); a residual that
+            // filled whole leaves nothing for the flag to waive
+            ch.roundUp |= uint8(_tget(UNLOCK_SLOT) & 4);
             _tset(UNLOCK_SLOT, 0);
         }
         charges[s] = ch;
@@ -685,6 +761,9 @@ contract MarketHoursHook is IUnlockCallback {
 
     /// @dev Book 2d: from closeSettled(d-1) to 11:50 of d. Book 2d+1: from ringOpen to 15:50 of d.
     function _enterable(uint256 s) internal view returns (bool) {
+        // no book before the pool has a price: placeOrder (NotEnterable) and cancelOrder (CancelLocked) both refuse, so
+        // no order is ever valued at a reference that initialisation then moves
+        if (!initialized) return false;
         uint256 t = block.timestamp;
         uint256 d = t / 1 days;
         uint256 tod = t % 1 days;
@@ -752,6 +831,17 @@ contract MarketHoursHook is IUnlockCallback {
         _tset(LOCK_SLOT, 1);
         _;
         _tset(LOCK_SLOT, 0);
+    }
+
+    /// @dev One word from the manager: `sel(w)` for a one-word read (exttload here), its one-word answer.
+    function _managerWord(uint256 sel, bytes32 w) internal view returns (uint256 v) {
+        address m = address(manager);
+        assembly ("memory-safe") {
+            mstore(0, shl(224, sel))
+            mstore(4, w)
+            if iszero(staticcall(gas(), m, 0, 36, 0, 32)) { revert(0, 0) }
+            v := mload(0)
+        }
     }
 
     function _tget(uint256 slot) internal view returns (uint256 v) {
@@ -905,7 +995,7 @@ contract MarketHoursHook is IUnlockCallback {
     }
 
     /// @dev The gate, then the three anti-bot checks in order: size cap, price breaker, round trip.
-    function beforeSwap(address sender, PoolKey calldata, IPoolManager.SwapParams calldata p, bytes calldata)
+    function beforeSwap(address, PoolKey calldata, IPoolManager.SwapParams calldata p, bytes calldata)
         external
         returns (bytes4, BeforeSwapDelta, uint24)
     {
@@ -917,7 +1007,7 @@ contract MarketHoursHook is IUnlockCallback {
         (uint160 sp, int24 tick,,) = manager.getSlot0(PoolId.wrap(poolId));
         _sizeCap(p.zeroForOne, p.amountSpecified, sp);
         _breaker(sp, tick);
-        _roundTrip(sender, p.zeroForOne);
+        _roundTrip(p.zeroForOne);
         return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
@@ -961,13 +1051,12 @@ contract MarketHoursHook is IUnlockCallback {
         window = w;
     }
 
-    /// @dev Round trip: one direction per resolved identity per block (a speed bump, not a wall). The identity is the
-    ///      router's reported `msgSender()` only when it is the transaction's own signer; any other report, or none, makes
-    ///      the router itself the identity, so a router cannot spend somebody else's direction for the block.
-    function _roundTrip(address sender, bool zeroForOne) internal {
-        address id = sender;
-        (bool ok, bytes memory ret) = sender.staticcall(abi.encodeWithSelector(0xd737d0c7)); // msgSender()
-        if (ok && ret.length == 32 && abi.decode(ret, (uint256)) == uint256(uint160(tx.origin))) id = tx.origin;
+    /// @dev Round trip: one direction per transaction signer per block (a speed bump, not a wall). The identity is the
+    ///      signer, tx.origin, whatever the router: a router that reports the signer through msgSender() resolved to it
+    ///      before, and one that does not was keyed on the router itself, which coupled every user of that router. No
+    ///      router can spend somebody else's direction, since it cannot sign for them.
+    function _roundTrip(bool zeroForOne) internal {
+        address id = tx.origin;
         uint256 dir = zeroForOne ? 1 : 0;
         uint256 last = lastSwap[id];
         if (last >> 1 == block.number && last & 1 != dir) revert RoundTrip();
@@ -983,14 +1072,13 @@ contract MarketHoursHook is IUnlockCallback {
         return int24(q * 60);
     }
 
-    /// @dev The bucket edge moved inward by the pool's fee (`fee` ppm, from the PoolKey). The pool takes the fee from
+    /// @dev The bucket edge moved inward by the pool's fee (FEE ppm, through FEE_ROOT_Q96). The pool takes the fee from
     ///      the input, so a swap whose spot stays within `edge` pays at worst spot/(1 - fee) per unit out; scaling the
     ///      price limit by (1 - fee) (the sqrt by its root) makes that fee-inclusive worst case exactly the edge price.
     ///      zeroForOne moves the price down, so its floor goes up; oneForZero moves it up, so its ceiling comes down.
     ///      Both roundings (the floor sqrt, the round-up on the floor) move the limit further inward, never outward.
-    function _feeInward(uint160 edge, bool zfo, uint24 fee) internal pure returns (uint160) {
-        uint256 rootQ96 = Math.sqrt(((1_000_000 - uint256(fee)) << 192) / 1_000_000); // sqrt(1 - fee) in Q96, rounded down
-        return uint160(zfo ? FullMath.mulDivRoundingUp(edge, Q96, rootQ96) : FullMath.mulDiv(edge, rootQ96, Q96));
+    function _feeInward(uint160 edge, bool zfo) internal pure returns (uint160) {
+        return uint160(zfo ? FullMath.mulDivRoundingUp(edge, Q96, FEE_ROOT_Q96) : FullMath.mulDiv(edge, FEE_ROOT_Q96, Q96));
     }
 
     /// @dev Runs the one swap the hook queued (a bell's residual or an exit), exact input, and settles it from the hook's
@@ -1003,9 +1091,48 @@ contract MarketHoursHook is IUnlockCallback {
         bool zfo = imdIn == imdIs0;
         PoolKey memory k = _key();
         uint160 limit = limited
-            ? _feeInward(TickMath.getSqrtPriceAtTick(imdIs0 ? -limitB : limitB), zfo, k.fee)
+            ? _feeInward(TickMath.getSqrtPriceAtTick(imdIs0 ? -limitB : limitB), zfo)
             : (zfo ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1);
-        BalanceDelta d = manager.swap(k, IPoolManager.SwapParams(zfo, -int256(amountIn), limit), "");
+        if (limited) {
+            // a bell's residual also stops RESIDUAL_MAX_BUCKETS buckets from the pool's price now, whichever comes first.
+            // Without it, dust positions planted at every bucket on the way could make the residual need more gas than a
+            // transaction may carry. The pool's sqrt price is the low 160 bits of its state's first word: v4's pools
+            // mapping (slot 6) at the pool's id (the key's hash, as PoolIdLibrary.toId makes it), read by
+            // extsload(bytes32) from the caller, the manager. Shifted up 96 bits (the rest of the word falls off the top)
+            // over the cap's divisor, it is the price RESIDUAL_MAX_BUCKETS buckets on, to within a wei.
+            assembly ("memory-safe") {
+                mstore(0, keccak256(k, 0xa0))
+                mstore(32, 6)
+                let w := keccak256(0, 64)
+                mstore(0, shl(224, 0x1e2eaeaf))
+                mstore(4, w)
+                if iszero(staticcall(gas(), caller(), 0, 36, 0, 32)) { revert(0, 0) }
+                // down (zfo) over R, up over 2^192 / R
+                let q := CAP_DOWN
+                if iszero(zfo) { q := div(shl(192, 1), q) }
+                let c := div(shl(96, mload(0)), q)
+                // the cap is the nearer limit (down: above P*'s, up: below it): it becomes the limit, flagged for _ring
+                // (UNLOCK_SLOT = 5, bit 2), which waives the unfilled-order fee on what it leaves unfilled
+                if xor(zfo, lt(c, add(limit, zfo))) {
+                    limit := c
+                    tstore(UNLOCK_SLOT, 5)
+                }
+            }
+        }
+        BalanceDelta d;
+        // the swap in its own `try`, so the pool's own refusal is told apart from every other failure: the price already
+        // at or past the limit trades nothing (a zero delta, so (0, 0) goes back); with no liquidity in range the swap
+        // itself returns nothing traded. Anything else, out of gas included, reverts the unlock and the bell with it.
+        try manager.swap(k, IPoolManager.SwapParams(zfo, -int256(amountIn), limit), "") returns (BalanceDelta x) {
+            d = x;
+        } catch {
+            assembly ("memory-safe") {
+                let e := mload(0x40)
+                returndatacopy(e, 0, returndatasize())
+                // PriceLimitAlreadyExceeded(uint160,uint160), v4's Pool library refusal
+                if iszero(and(gt(returndatasize(), 3), eq(shr(224, mload(e)), 0x7c9c6e8f))) { revert(e, returndatasize()) }
+            }
+        }
         uint256 spent = uint256(uint128(-(zfo ? d.amount0() : d.amount1())));
         uint256 got = uint256(uint128(zfo ? d.amount1() : d.amount0()));
         (Currency cin, Currency cout) = zfo ? (k.currency0, k.currency1) : (k.currency1, k.currency0);

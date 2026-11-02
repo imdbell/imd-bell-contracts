@@ -108,7 +108,7 @@ abstract contract Ringer is Gas {
         _at(D + 1, OPEN);
         _nextBlock();
         address bot = makeAddr("bot");
-        Rung memory o = _ringVia(m, bot, 9_000_000);
+        Rung memory o = _ringVia(m, bot, RING_GAS_T);
         assertTrue(o.open, "the opening bell");
         (, bool rung,,,,) = m.hook.bells(2 * (D + 1));
         assertTrue(rung, "the opening bell rang");
@@ -130,6 +130,7 @@ abstract contract Ringer is Gas {
     function test_R_closeRingSettlesAndRequestsTheNight() public {
         Mkt memory m = mkt;
         BellRinger r = _ringer(m);
+        _ethImdPrice(); // no ETH/IMD price pays nothing, so the offline env needs its pool for a reward
         _topUp(m, 10e18);
         _fundImd(address(m.budget), 2e18); // the night costs 1 IMD
         _at(D, OPEN);
@@ -137,7 +138,7 @@ abstract contract Ringer is Gas {
         m.hook.ringOpen();
         _at(D, CLOSE);
         _nextBlock();
-        Rung memory o = _ringVia(m, makeAddr("bot"), 9_000_000);
+        Rung memory o = _ringVia(m, makeAddr("bot"), RING_GAS_T);
         assertFalse(o.open, "the closing bell");
         (, bool rung,,,,) = m.hook.bells(2 * D + 1);
         assertTrue(rung, "the closing bell rang");
@@ -172,10 +173,10 @@ abstract contract Ringer is Gas {
             if (want[i] < 0) {
                 BellRinger r = _ringer(m);
                 vm.expectRevert(BellRinger.NoBellDue.selector);
-                r.ring{gas: 9_000_000}();
+                r.ring{gas: RING_GAS_T}();
                 continue;
             }
-            Rung memory o = _ringVia(m, makeAddr("bot"), 9_000_000);
+            Rung memory o = _ringVia(m, makeAddr("bot"), RING_GAS_T);
             assertEq(o.open, want[i] == 1, "the bell the clock chose");
             (, bool rungOpen,,,,) = m.hook.bells(2 * d);
             (, bool rungClose,,,,) = m.hook.bells(2 * d + 1);
@@ -189,11 +190,11 @@ abstract contract Ringer is Gas {
         _topUp(m, 10e18);
         _at(D, OPEN);
         _nextBlock();
-        _ringVia(m, makeAddr("first"), 9_000_000);
+        _ringVia(m, makeAddr("first"), RING_GAS_T);
         address second = makeAddr("second");
         uint256 held = _ringer(m).purse();
         vm.prank(second, second);
-        (bool ok, bytes memory e) = address(_ringer(m)).call{gas: 9_000_000}(abi.encodeCall(BellRinger.ring, ()));
+        (bool ok, bytes memory e) = address(_ringer(m)).call{gas: RING_GAS_T}(abi.encodeCall(BellRinger.ring, ()));
         assertFalse(ok, "the second ring in the block reverts");
         assertTrue(_has(e, MarketHoursHook.BellAlreadyRung.selector), "with the hook's own reason");
         assertEq(IERC20T(imd).balanceOf(second), 0, "and pays nothing");
@@ -224,7 +225,7 @@ abstract contract Ringer is Gas {
         setRingRate(_ringer(m), 1 gwei);
         _at(D, OPEN);
         _nextBlock();
-        Rung memory o = _ringVia(m, makeAddr("bot"), 9_000_000);
+        Rung memory o = _ringVia(m, makeAddr("bot"), RING_GAS_T);
         assertEq(o.paid, 0, "an empty purse pays nothing");
         (, bool rung,,,,) = m.hook.bells(2 * D);
         assertTrue(rung, "and the bell rang");
@@ -291,7 +292,7 @@ abstract contract Ringer is Gas {
             vm.cool(address(r));
             vm.cool(address(m.game));
             vm.cool(address(m.budget));
-            Rung memory o = _ringVia(m, fresh, 9_000_000);
+            Rung memory o = _ringVia(m, fresh, RING_GAS_T);
             assertLt(o.paid, r.RING_REWARD_CAP(), "precondition: under the cap, so the count can be read back");
             uint256 counted = (o.paid << 96) / priceX96 * 2 / 3 / 1 gwei;
             uint256 txCost = 21_064 + o.frame - 2_600;
@@ -381,7 +382,7 @@ abstract contract Ringer is Gas {
         (uint24 wd, uint32 wo, int48 ws, uint16 wc, bool wf) = m.hook.window();
         bytes memory w1 = abi.encode(wd, wo, ws, wc, wf);
         vm.revertToState(snap);
-        _ringVia(m, makeAddr("bot"), 9_000_000);
+        _ringVia(m, makeAddr("bot"), RING_GAS_T);
         (int24 p2, bool r2, bool h2, uint64 i2, uint64 mg2, uint64 rf2) = m.hook.bells(2 * D);
         assertEq(abi.encode(p1, r1, h1, i1, mg1, rf1), abi.encode(p2, r2, h2, i2, mg2, rf2), "the same bell");
         (cu, cr) = m.hook.charges(2 * D);

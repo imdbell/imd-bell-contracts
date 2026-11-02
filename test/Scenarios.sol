@@ -315,7 +315,8 @@ abstract contract Scenarios is Base {
         (, uint16 c0) = _counters(m);
         assertEq(c0, 0, "no checkpoint before the first session");
         m.hook.ringOpen();
-        assertEq(m.hook.lastCleared(), ref0, "open, zero matches, tickCount 0: lastCleared unchanged");
+        // audit finding 2: no checkpoint has ever been taken, so the reference stays where initialisation set it
+        assertEq(m.hook.lastCleared(), ref0, "open, zero matches, no checkpoint ever: lastCleared unchanged");
         int256 sum;
         for (uint256 i; i < 3; ++i) {
             _nextBlock();
@@ -340,8 +341,13 @@ abstract contract Scenarios is Base {
         assertTrue(_nearest(_tick(m)) != expectP, "the exit moved spot to another bucket (test precondition)");
         (, uint16 c3) = _counters(m);
         assertEq(c3, 0, "the exit swap was not counted");
+        // audit finding 2: the open after an exit-only night reads the last checkpoint's price (the start of the session's
+        // last trading block), which the hook's own exits never set: neither the exit's spot nor the closing mean
+        (, uint160 cpSp,,) = m.hook.checkpoint();
+        int24 lastCp = _nearest(TickMath.getTickAtSqrtPrice(cpSp));
+        assertTrue(lastCp != _nearest(_tick(m)), "the last checkpoint sits in another bucket than the exit's spot (test precondition)");
         _at(D + 1, OPEN);
         m.hook.ringOpen();
-        assertEq(m.hook.lastCleared(), expectP, "open after an exit-only night: lastCleared unchanged");
+        assertEq(m.hook.lastCleared(), lastCp, "open after an exit-only night: the last checkpoint's price, never the exit's spot");
     }
 }

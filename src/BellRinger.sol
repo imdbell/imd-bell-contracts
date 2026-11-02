@@ -17,8 +17,8 @@ interface IRingerToken {
 
 /// @title The bell ringer: whoever rings a bell first is paid from the bell purse
 /// @notice `ring()` rings whichever bell the clock says is due, runs that bell's chores, then pays the caller the ring's
-///         gas at the base fee plus a fixed tip allowance, half again, in IMD at the ETH/IMD pool's price, at most 3 IMD
-///         and at most what the purse holds. An empty purse pays nothing and the bell still rings. A chore that fails
+///         gas at the base fee plus a fixed tip allowance, half again, in IMD at the ETH/IMD pool's price (nothing if
+///         that price cannot be read), at most 3 IMD and at most what the purse holds. An empty purse pays nothing and the bell still rings. A chore that fails
 ///         is skipped and never stops the bell or the reward. `pushBurnRewarded()` does the same for the hook's burn, at
 ///         most 0.5 IMD, and only when the burn crossed the bridge. Anyone may top the purse up.
 /// @dev Created by the hook in its constructor, so every reference here is fixed by that one deployment. Nobody owns it;
@@ -30,6 +30,7 @@ contract BellRinger {
     error Reentrant();
     error TransferFailed();
     error NoEth();
+    error BellAlreadyRung();
 
     /// @notice `caller` rang a bell (`open` says which) and was paid `amount` IMD; 0 when the purse was empty.
     event Rewarded(address indexed caller, uint256 amount, bool open);
@@ -39,6 +40,8 @@ contract BellRinger {
     ///         5 claimNetworkFees, 6 settle, 7 requestNight; `reason` is the revert's first four bytes (zero when it ran
     ///         out of gas or reverted without data).
     event ChoreSkipped(uint8 indexed chore, bytes4 reason);
+    /// @notice The ETH/IMD price read failed, was zero or was out of range, so this reward was 0.
+    event NoPrice();
 
     // the hook's schedule, in UTC seconds into the day
     uint256 internal constant OPEN_BELL = 43200;
@@ -48,7 +51,7 @@ contract BellRinger {
     uint256 public constant RING_REWARD_CAP = 3e18;
     uint256 public constant PUSH_REWARD_CAP = 0.5e18;
 
-    // Each chore's gas, about twice the most it was measured to need on the fork, so a chore that behaves always fits
+    // Each chore's gas, about twice the most it was measured to need, so a chore that behaves always fits
     // and one that misbehaves can take no more than this. harvest's is set by its worst case instead: seven storage
     // slots it can write from zero.
     uint256 public constant GAS_CLAIM_FEES = 360_000;
@@ -91,6 +94,9 @@ contract BellRinger {
     uint256 public immutable bellGasFloor;
     bytes32 public immutable ethImdPoolId;
     bytes32 internal immutable priceSlot;
+    /// @dev The last bell (its book: 2 x day for the open, 2 x day + 1 for the close) whose chores ran here. `ring()`
+    ///      only ever serves the bell due now, so one word does the work of a flag per bell.
+    uint256 internal choresDone;
 
     constructor(
         address hook_,
@@ -133,8 +139,10 @@ contract BellRinger {
         return imd.balanceOf(address(this));
     }
 
-    /// @notice Rings the bell that is due, runs its chores, pays the caller. A bell that cannot ring (already rung, or
-    ///         the hook refuses) reverts the whole call, so a second ringer in the same block pays gas and is paid nothing.
+    /// @notice Rings the bell that is due, runs its chores, pays the caller. A bell somebody already rang straight at the
+    ///         hook is not rung again, but its chores still run here once and the caller is paid for this call's gas.
+    ///         Once a bell's chores have run here a further call reverts, so a second ringer pays gas and is paid
+    ///         nothing; a bell the hook refuses to ring (out of gas included) reverts the whole call.
     function ring() external nonReentrant {
         uint256 gasStart = gasleft();
         uint256 t = block.timestamp;
@@ -146,15 +154,35 @@ contract BellRinger {
         // leave a chore short of its stipend. The chores' sum is far above 1/64 of the floor, so the 63/64 the hook
         // is passed still clears the hook's own check.
         if (gasStart < bellGasFloor + (open ? CHORE_GAS_OPEN : CHORE_GAS_CLOSE)) revert GasShort();
+        // one round of chores and one reward per bell, whether this call rings the bell or somebody rang it straight at
+        // the hook first (a direct ring would otherwise make every ring() revert and skip the chores)
+        uint256 s = open ? 2 * d : 2 * d + 1;
+        if (choresDone == s) revert BellAlreadyRung();
+        choresDone = s;
+        address h = address(hook);
+        uint256 sel = open ? 0x5e552393 : 0xae072a89; // ringOpen() / ringClose()
+        assembly ("memory-safe") {
+            // bells(uint256): its second word says whether the bell is rung already
+            mstore(0, shl(224, 0x507338ec))
+            mstore(4, s)
+            if iszero(staticcall(gas(), h, 0, 36, 0, 64)) { revert(0, 0) }
+            if iszero(mload(32)) {
+                // not rung: ring it; any refusal of the hook's, out of gas included, reverts this whole call
+                mstore(0, shl(224, sel))
+                if iszero(call(gas(), h, 0, 0, 4, 0, 0)) {
+                    let e := mload(0x40)
+                    returndatacopy(e, 0, returndatasize())
+                    revert(e, returndatasize())
+                }
+            }
+        }
         if (open) {
-            hook.ringOpen();
             _chore(1, factory, abi.encodeWithSelector(0xe0d0eac4, launchNumber), GAS_CLAIM_FEES); // claimFees(uint64)
             _chore(2, address(hook), abi.encodeWithSelector(0x4641257d), GAS_HARVEST); // harvest()
             _chore(3, address(hook), abi.encodeWithSelector(0xabb74d4b), GAS_SWARM); // claimSwarmBudget()
             _chore(4, address(hook), abi.encodeWithSelector(0x6b58a30f), GAS_PURSE); // claimBellPurse()
             _chore(5, address(hook), abi.encodeWithSelector(0xe67eccdd), GAS_NETWORK); // claimNetworkFees()
         } else {
-            hook.ringClose();
             _chore(6, game, abi.encodeWithSelector(0x8df82800, d), GAS_SETTLE); // settle(uint256)
             _chore(7, swarmBudget, abi.encodeWithSelector(0x01e20f20, d + 1), GAS_NIGHT); // requestNight(uint256)
         }
@@ -216,9 +244,9 @@ contract BellRinger {
     }
 
     /// @dev min(cap, 1.5 x (gasUsed x (basefee + TIP_ALLOWANCE) + extraWei) in IMD at the pool's spot). The spot is
-    ///      sqrtP^2 / 2^192 IMD per ETH. A failed, zero or absurd read pays the cap: the cap is what bounds a bad or
-    ///      manipulated price.
-    function _reward(uint256 gasUsed, uint256 extraWei, uint256 cap) internal view returns (uint256) {
+    ///      sqrtP^2 / 2^192 IMD per ETH. A failed, zero or out-of-range read pays nothing, with `NoPrice`: without a
+    ///      price there is no reward, never the cap. A cost too large to price safely pays the cap.
+    function _reward(uint256 gasUsed, uint256 extraWei, uint256 cap) internal returns (uint256) {
         uint256 costWei = gasUsed * (block.basefee + TIP_ALLOWANCE) + extraWei;
         address mgr = manager;
         bytes32 slot = priceSlot;
@@ -231,7 +259,11 @@ contract BellRinger {
             if and(ok, gt(returndatasize(), 31)) { sp := and(mload(0), 0xffffffffffffffffffffffffffffffffffffffff) }
         }
         // a sqrt price at or above 2^128 is a price of 2^64 IMD per ETH or more; past it the product below could overflow
-        if (sp == 0 || sp >> 128 != 0 || costWei >> 95 != 0) return cap;
+        if (sp == 0 || sp >> 128 != 0) {
+            emit NoPrice();
+            return 0;
+        }
+        if (costWei >> 95 != 0) return cap;
         uint256 r = (costWei * 3 / 2) * (sp * sp >> 96) >> 96;
         return r < cap ? r : cap;
     }

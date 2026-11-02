@@ -179,7 +179,7 @@ abstract contract Invariants is Scenarios {
     function test_I8_gasFloorBeforeTheCross() public {
         Mkt memory m = mkt;
         assertEq(m.hook.BELL_GAS_FLOOR(), GAS_FLOOR_T, "the harness's floor figure equals the hook's");
-        assertEq(GAS_FLOOR_T, 7_000_000, "the decided floor");
+        assertEq(GAS_FLOOR_T, 10_600_000, "the band's worst residual + 15 %, rounded up");
         _at(D, 1 hours);
         _order(m, 2 * D, false, -60, 10e18);
         _order(m, 2 * D, true, 60, 980e18);

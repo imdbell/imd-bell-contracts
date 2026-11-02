@@ -10,6 +10,9 @@ import {Stateful} from "./Stateful.sol";
 import {StandInIntake, StandInBurnExecutor, StandInLaunchFees} from "./StandIns.sol";
 import {RingerUnit} from "./RingerUnit.sol";
 import {RingerStateful} from "./RingerStateful.sol";
+import {AuditFixes} from "./AuditFixes.sol";
+import {FeeRootAndCap} from "./FeeRootAndCap.sol";
+import {ResidualCap} from "./ResidualCap.sol";
 
 /// The offline environment: a local PoolManager, a stand-in IMD, a stand-in burn executor, a stand-in fee setting and
 /// a stand-in Intake. Run with `forge test`; no network is needed.
@@ -49,3 +52,16 @@ contract DevRingerUnitTest is RingerUnit {}
 
 /// The ringer against hostile chores over many days.
 contract DevRingerStatefulTest is RingerStateful {}
+
+/// The audit's fixes beyond the audit's reproduction tests (test/repro), and a few figures (dense pools).
+contract DevAuditFixesTest is AuditFixes, DevEnv {}
+
+/// The fee root's constant and the residual cap's constants.
+contract DevFeeRootAndCapTest is FeeRootAndCap, DevEnv {}
+
+/// The residual's bucket cap and the gas floor's worst case (dense pools).
+contract DevResidualCapTest is ResidualCap, DevEnv {
+    function setUp() public override(Base, ResidualCap) {
+        super.setUp();
+    }
+}

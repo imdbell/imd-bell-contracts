@@ -51,7 +51,9 @@ abstract contract Base is Test {
     // the harness's figures: the ones the hook takes as constructor arguments
     uint256 internal constant X_BPS = 500;
     uint256 internal constant MAX_SWAP_T = 10_000e18;
-    uint256 internal constant GAS_FLOOR_T = 7_000_000; // must equal the hook's BELL_GAS_FLOOR (asserted in a test)
+    uint256 internal constant GAS_FLOOR_T = 10_600_000; // must equal the hook's BELL_GAS_FLOOR (asserted in a test)
+    /// The gas the tests give a ring through the ringer: above the floor plus the closing chores (11,440,000)
+    uint256 internal constant RING_GAS_T = 13_000_000;
     uint256 internal constant CAP0_T = 1_000e18;
     uint256 internal constant CAP_MAX_T = 100_000e18;
     /// the launch number the harness's hooks are built with; the test contract plays the factory, so its own

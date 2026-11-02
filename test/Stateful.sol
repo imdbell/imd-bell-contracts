@@ -62,6 +62,9 @@ contract Handler is Test {
     uint256 public purseIn;
     uint256 public purseOut;
     uint256 public ringerRings;
+    /// The bells whose chores the ringer has run (once each, whether it rang them or a direct ring did)
+    mapping(uint256 => bool) public ringerServed;
+    uint256 public ringerChoresOnly; // rings that found the bell already rung straight at the hook
     uint256 public ringerRewards;
 
     struct Sealed {
@@ -217,8 +220,21 @@ contract Handler is Test {
         _ring(2 * d + 1, false, expectOk);
     }
 
+    /// Audit finding 2: the pool's own price a bell reads before its residual, as a bucket: the session's checkpoint mean
+    /// if it traded, else the last checkpoint's price, else (no checkpoint ever) the reference as it stands; held to
+    /// +-875,220 ticks (the harness's coin sorts below IMD, so a bucket is the pool tick)
+    function _anchorNow() internal view returns (int24) {
+        (, uint160 sp, int48 sum, uint16 count) = hook.checkpoint();
+        if (count == 0 && sp == 0) return hook.lastCleared();
+        int256 t = count > 0 ? int256(sum) / int256(uint256(count)) : int256(TickMath.getTickAtSqrtPrice(sp));
+        if (t > 875_220) t = 875_220;
+        if (t < -875_220) t = -875_220;
+        return _nearest(t);
+    }
+
     function _ring(uint256 s, bool open, bool expectOk) internal {
         (,, int48 sum0, uint16 count0) = hook.checkpoint();
+        int24 anchor0 = _anchorNow();
         uint256 i0 = imd.balanceOf(address(hook));
         uint256 c0 = coin.balanceOf(address(hook));
         uint256 b0 = hook.burnAccrued();
@@ -244,7 +260,7 @@ contract Handler is Test {
         assertLe(closes[s / 2], 1, "two bells: two closes in a day");
         (int24 p, bool rung, bool buyHeavy,,, uint64 rf) = hook.bells(s);
         assertTrue(rung);
-        assertEq(hook.lastCleared(), p, "reference chain: lastCleared = the bell's P*");
+        assertEq(hook.lastCleared(), anchor0, "reference chain: the next reference = the pool's own price before the bell");
         (,, int48 sum1, uint16 count1) = hook.checkpoint();
         assertEq(count1, 0, "the counters reset at the ring");
         assertEq(int256(sum1), 0);
@@ -269,18 +285,14 @@ contract Handler is Test {
                 assertGe(hook.burnAccrued() - b0 + _c2i(spent, sp) + 64, got, "residual price: the sell improvement was not booked");
             }
         }
-        // A zero-match bell with checkpoints clears at the mean's bucket; with none, at the reference
+        // stale reference: a zero-match bell clears at the pool's own price (the mean's bucket with checkpoints, spot's with
+        // none), held inside the band
         if (matchedBefore == 0) {
-            if (count0 > 0) {
-                int256 mean = int256(sum0) / int256(uint256(count0));
-                int24 want = _nearest(mean);
-                int24 lo = ref - 200 * 60;
-                if (want < lo) want = lo;
-                if (want > ref + 200 * 60) want = ref + 200 * 60;
-                assertEq(p, want, "stale reference: zero matches with checkpoints -> the mean's bucket");
-            } else {
-                assertEq(p, ref, "stale reference: zero matches, no checkpoints -> the reference");
-            }
+            int24 want = anchor0;
+            int24 lo = ref - 200 * 60;
+            if (want < lo) want = lo;
+            if (want > ref + 200 * 60) want = ref + 200 * 60;
+            assertEq(p, want, count0 > 0 ? "stale reference: zero matches with checkpoints -> the mean's bucket" : "stale reference: zero matches, no checkpoints -> spot's bucket");
         }
     }
 
@@ -290,28 +302,38 @@ contract Handler is Test {
         uint256 tod = _tod();
         bool open = tod >= OPEN && tod < CLOSE;
         uint256 s = open ? 2 * d : 2 * d + 1;
-        bool expectOk = (open || (tod >= CLOSE && tod < 72000)) && !_rung(s);
+        // due and not yet served by the ringer; a bell rung straight at the hook is still served once
+        bool expectOk = (open || (tod >= CLOSE && tod < 72000)) && !ringerServed[s];
+        bool wasRung = _rung(s);
+        int24 lc0 = hook.lastCleared();
+        int24 anchor0 = _anchorNow();
         uint256 held0 = imd.balanceOf(address(ringer));
-        // a real rate, so the reward is not zero (offline there is no ETH/IMD pool: the read is zero, the cap pays)
+        // a real rate, so the reward is not zero where the env has an ETH/IMD price (none offline pays 0)
         uint256 bf0 = setRingRate(ringer, 1 gwei);
         vm.recordLogs();
-        (bool ok,) = address(ringer).call{gas: 9_500_000}(abi.encodeCall(BellRinger.ring, ()));
+        // above the raised floor plus the closing chores (Base.RING_GAS_T)
+        (bool ok,) = address(ringer).call{gas: 13_000_000}(abi.encodeCall(BellRinger.ring, ()));
         Vm.Log[] memory lg = vm.getRecordedLogs();
         clearRingRate(bf0);
-        assertEq(ok, expectOk, "ringing: ring() rang iff a bell was due and unrung");
+        assertEq(ok, expectOk, "ringing: ring() succeeded iff a bell was due and its chores not yet run by the ringer");
         if (!ok) {
             assertEq(imd.balanceOf(address(ringer)), held0, "ringer purse: a ring that rang nothing moved the purse");
             return;
         }
         assertTrue(_rung(s), "ringing: the bell rang");
-        ++ringsOk;
+        ringerServed[s] = true;
         ++ringerRings;
-        if (open) ++opens[d];
-        else ++closes[d];
+        if (wasRung) {
+            ++ringerChoresOnly;
+        } else {
+            ++ringsOk;
+            if (open) ++opens[d];
+            else ++closes[d];
+        }
         assertLe(opens[d], 1, "two bells: two opens in a day");
         assertLe(closes[d], 1, "two bells: two closes in a day");
-        (int24 p,,,,,) = hook.bells(s);
-        assertEq(hook.lastCleared(), p, "reference chain: lastCleared = the bell's P*");
+        // reference chain: a bell this call rang sets the next reference to the pool's own price; chores alone leave it
+        assertEq(hook.lastCleared(), wasRung ? lc0 : anchor0, "reference chain: the next reference = the pool's own price before the bell");
         uint256 inflow;
         uint256 paid;
         bool rewarded;
@@ -979,11 +1001,11 @@ abstract contract Stateful is Base {
         assertEq(mkt.coin.totalSupply(), h.coinSupply0() - h.burnedCoin(), "coin supply: the supply is the start less what burnCoin burned");
     }
 
+    /// Audit finding 2: one reference at a time, the one the handler checked against the pool at each bell
     function invariant_I15_referenceChain() public view {
         uint256 d = block.timestamp / 1 days;
-        (int24 pOpen, bool rungOpen,,,,) = mkt.hook.bells(2 * d);
-        if (rungOpen) assertEq(mkt.hook.referenceOf(2 * d + 1), pOpen, "reference chain: the closing book's reference is the opening P*");
-        assertEq(mkt.hook.referenceOf(2 * (d + 1)), mkt.hook.lastCleared(), "reference chain: the overnight reference is the last bell");
+        assertEq(mkt.hook.referenceOf(2 * d + 1), mkt.hook.lastCleared(), "reference chain: the closing book's reference is lastCleared");
+        assertEq(mkt.hook.referenceOf(2 * (d + 1)), mkt.hook.lastCleared(), "reference chain: the overnight reference is lastCleared");
     }
 
     function invariant_I24_noOwner() public {
@@ -1006,6 +1028,7 @@ abstract contract Stateful is Base {
         console2.log("   unfilled fees: IMD / coin (wei)", h.unfilledImd(), h.unfilledCoin());
         console2.log("   ringer rings / paid rings / purse in / purse out (wei)", h.ringerRings(), h.ringerRewards());
         console2.log("   ", h.purseIn(), h.purseOut());
+        console2.log("   ringer rings that found the bell already rung (chores only)", h.ringerChoresOnly());
         assertEq(failed, 0, "claims: an order could not be claimed exactly once at the end");
         assertEq(shortImd, 0, "strict IMD accounting: the hook ended short of IMD");
         assertEq(shortCoin, 0, "strict coin accounting: the hook ended short of coin");

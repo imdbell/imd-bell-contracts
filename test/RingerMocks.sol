@@ -149,6 +149,12 @@ contract MockRingHook is ChoreBox {
         return true;
     }
 
+    /// the hook's `bells(s)` getter as far as the ringer reads it (the ringer asks whether a bell was already
+    /// rung straight at the hook before it rings): P* (unused, 0) and `rung`
+    function bells(uint256 s) external view returns (int24, bool) {
+        return (0, rung[s]);
+    }
+
     function ringOpen() external {
         _ring(2 * (block.timestamp / 1 days));
     }

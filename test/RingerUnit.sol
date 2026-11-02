@@ -524,31 +524,34 @@ abstract contract RingerUnit is Test {
         assertGt(imd.balanceOf(bot), 0, "paid after");
     }
 
+    /// A reverting, short, starving, zero or out-of-range read pays nothing, with NoPrice, never the cap; the
+    /// bell still rings and its chores still run.
     function test_RU_priceReadFails() public {
         _fund(30e18);
         uint8[3] memory hows = [uint8(1), 2, 3];
-        for (uint256 i; i < 3; ++i) {
+        for (uint256 i; i < 6; ++i) {
             ++day;
             _at(OPEN);
-            _price(SP400, hows[i]);
-            (uint256 paid,) = _ring();
-            assertEq(paid, r.RING_REWARD_CAP(), "a reverting, short or starving read pays the cap");
+            if (i < 3) _price(SP400, hows[i]);
+            else _price(i == 3 ? 0 : i == 4 ? uint256(1) << 128 : type(uint160).max, 0);
+            uint256 held = imd.balanceOf(address(r));
+            vm.recordLogs();
+            vm.prank(bot, bot);
+            r.ring{gas: 9_000_000}();
+            Vm.Log[] memory lg = vm.getRecordedLogs();
+            uint256 noPrice;
+            uint256 paid = type(uint256).max;
+            for (uint256 j; j < lg.length; ++j) {
+                if (lg[j].emitter != address(r)) continue;
+                if (lg[j].topics[0] == BellRinger.NoPrice.selector) ++noPrice;
+                if (lg[j].topics[0] == BellRinger.Rewarded.selector) (paid,) = abi.decode(lg[j].data, (uint256, bool));
+            }
+            assertEq(paid, 0, "a reverting, short, starving, zero or out-of-range read pays nothing");
+            assertEq(noPrice, 1, "and says so, once");
+            assertEq(imd.balanceOf(address(r)), held, "the purse kept everything");
+            assertTrue(hook.rung(2 * day), "the bell still rang");
+            assertEq(factory.calls(CLAIM_FEES), i + 1, "and its chores still ran");
         }
-        ++day;
-        _at(OPEN);
-        _price(0, 0);
-        (uint256 p0,) = _ring();
-        assertEq(p0, r.RING_REWARD_CAP(), "a zero read pays the cap");
-        ++day;
-        _at(OPEN);
-        _price(uint256(1) << 128, 0);
-        (p0,) = _ring();
-        assertEq(p0, r.RING_REWARD_CAP(), "an absurd read (2^64 IMD per ETH or more) pays the cap");
-        ++day;
-        _at(OPEN);
-        _price(type(uint160).max, 0);
-        (p0,) = _ring();
-        assertEq(p0, r.RING_REWARD_CAP(), "the largest sqrt price pays the cap, it does not overflow");
     }
 
     /// The price is IMD per ETH: a dearer ETH (more IMD per ETH) pays more IMD for the same gas.
@@ -561,6 +564,8 @@ abstract contract RingerUnit is Test {
         vm.revertToState(snap);
         _price(10 << 96, 0); // 100 IMD per ETH, from the same state
         (uint256 p100,) = _ring();
+        // a failed price read now pays 0 (the zero-price fix), so the ratio alone passes on 0 = 4 x 0
+        assertGt(p100, 0, "a price was read: the reward is not zero");
         assertApproxEqRel(p400, 4 * p100, 0.001e18, "four times the IMD per ETH, four times the reward");
         assertEq(r.ethImdPoolId(), keccak256(abi.encode(address(0), address(imd), uint24(10_000), int24(200), address(0))),
             "the pool is ETH (currency0) / IMD, fee 1 %, spacing 200, no hook");

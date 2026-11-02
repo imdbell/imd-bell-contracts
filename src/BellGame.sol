@@ -111,24 +111,28 @@ contract BellGame {
 
     /// @notice Settles `day`'s opening price for the game, once, on that day: once the thirty minutes from the bell's
     ///         own time have passed if the open rang (12:30 for a bell at 12:00, later for a later bell), else from 16:00,
-    ///         when the day is void. A day whose window held no checkpoint scores the bell's own price. Reads the hook's
-    ///         window; never changes it.
+    ///         when the day is void. A bell so late that its thirty minutes reach 16:00 leaves no time to reveal, so that
+    ///         day is void too: no points, and nothing ranks. A day whose window held no checkpoint scores the bell's own
+    ///         price. Reads the hook's window; never changes it.
     function settle(uint256 day) external {
         uint256 t = block.timestamp;
         if (t / 1 days != day) revert WrongDay();
         DayState storage ds = dayState[day];
         if (ds.settled) revert AlreadySettled();
         (int24 pStar, bool rung,,,,) = hook.bells(2 * day);
-        if (!rung) {
-            if (t % 1 days < CLOSE_BELL) revert TooEarly();
+        (int256 sum, uint256 n, uint256 openedAt, bool frozen) = hook.sessionMean();
+        // the window runs from the bell's own time; read before it ends, the caller would choose how much of it counts.
+        // With no bell the day waits for the close.
+        uint256 close = day * 1 days + CLOSE_BELL;
+        uint256 end = rung ? openedAt + SETTLE_WINDOW : close;
+        if (t < end) revert TooEarly();
+        // no bell, or a bell so late that its window reaches the close: no reveal window is left, so the day is void
+        if (end >= close) {
             ds.settled = true;
             ds.isVoid = true;
             emit DayVoid(day);
             return;
         }
-        (int256 sum, uint256 n, uint256 openedAt, bool frozen) = hook.sessionMean();
-        // the window runs from the bell's own time; read before it ends, the caller would choose how much of it counts
-        if (t < openedAt + SETTLE_WINDOW) revert TooEarly();
         int24 scored = pStar;
         if (n > 0) scored = _nearestBucket(imdIs0 ? -(sum / int256(n)) : sum / int256(n));
         ds.settled = true;
