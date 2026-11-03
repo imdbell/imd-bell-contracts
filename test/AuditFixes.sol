@@ -108,24 +108,30 @@ abstract contract AuditFixes is GasOps {
         assertTrue(rung, "audit finding 2: and the next bell still rings");
     }
 
-    // ── Audit finding 3: the cap counts an order by its distance, and a cancel releases exactly what it counted ──
+    // ── Audit finding 3: the cap counts a passive order by its distance and a marketable one in full, and a cancel releases exactly
+    //    what it counted ──
     function test_A3_countedByDistanceReleasedExactly() public {
         Mkt memory m = mkt;
         _at(D, 1 hours);
         int24 ref = m.hook.referenceOf(2 * D);
         assertEq(ref, 0, "precondition: the reference is bucket 0, so a coin is worth one IMD there");
-        uint256 far = _order(m, 2 * D, true, ref - 12_000, 1_000e18); // a tenth
-        assertEq(m.hook.bookImdTotal(2 * D), 100e18, "audit finding 3: an order at the band's edge counts a tenth");
-        uint256 mid = _order(m, 2 * D, false, ref + 6_000, 20e18); // (40,000 - 18,000) / 40,000 = 0.55
-        assertEq(m.hook.bookImdTotal(2 * D), 111e18, "audit finding 3: half way out counts 55 %");
-        uint256 near = _order(m, 2 * D, true, ref, 10e18); // in full
-        assertEq(m.hook.bookImdTotal(2 * D), 121e18, "audit finding 3: at the reference it counts in full");
+        uint256 far = _order(m, 2 * D, true, ref - 12_000, 1_000e18); // passive at the edge: 1 %
+        assertEq(m.hook.bookImdTotal(2 * D), 10e18, "audit finding 3: a passive order at the band's edge counts 1 %");
+        uint256 mid = _order(m, 2 * D, false, ref + 6_000, 20e18); // (1,200,000 - 594,000) / 1,200,000 = 0.505
+        assertEq(m.hook.bookImdTotal(2 * D), 20.1e18, "audit finding 3: a passive sell half way out counts 50.5 %");
+        uint256 near = _order(m, 2 * D, true, ref, 10e18); // at the reference: in full
+        assertEq(m.hook.bookImdTotal(2 * D), 30.1e18, "audit finding 3: at the reference it counts in full");
+        uint256 up = _order(m, 2 * D, true, ref + 6_000, 10e18); // a marketable buy: in full
+        uint256 down = _order(m, 2 * D, false, ref - 12_000, 10e18); // a marketable sell at the edge: in full
+        assertEq(m.hook.bookImdTotal(2 * D), 50.1e18, "audit finding 3: marketable orders count in full wherever they sit");
         vm.startPrank(trader);
         m.hook.cancelOrder(far);
-        assertEq(m.hook.bookImdTotal(2 * D), 21e18, "audit finding 3: a cancel releases exactly what the order counted");
+        assertEq(m.hook.bookImdTotal(2 * D), 40.1e18, "audit finding 3: a cancel releases exactly what the order counted");
         m.hook.cancelOrder(mid);
-        assertEq(m.hook.bookImdTotal(2 * D), 10e18, "audit finding 3: the sell's counted amount, stored, not re-valued");
+        assertEq(m.hook.bookImdTotal(2 * D), 30e18, "audit finding 3: the sell's counted amount, stored, not re-valued");
         m.hook.cancelOrder(near);
+        m.hook.cancelOrder(up);
+        m.hook.cancelOrder(down);
         vm.stopPrank();
         assertEq(m.hook.bookImdTotal(2 * D), 0, "audit finding 3: every cancel together releases the whole total");
     }
@@ -194,18 +200,20 @@ abstract contract AuditFixes is GasOps {
     }
 
     // ── figures ──
-    /// Audit finding 3: what holding a book with orders that do not trade costs now, per bell, by week: the escrow that fills the
-    /// counted cap at the band's edge (ten caps) and half way out (cap / 0.55), and 0.5 % of it, the unfilled fee.
+    /// Audit finding 3: what holding a book costs, per bell, by week, under the one-sided weight: the escrow that fills the counted
+    /// cap with a passive order at the band's edge (a hundred caps), one bucket off the reference (cap / 0.99505) and
+    /// with a marketable order (the cap), and 0.5 % of each, the cancel or unfilled fee.
     function test_A_measure_capHoldCostByWeek() public {
         uint256 d0 = mkt.hook.d0();
         for (uint256 w; w <= 8; ++w) {
             vm.warp((d0 + 7 * w) * 1 days + 1 hours);
             uint256 cap = mkt.hook.depositCap();
-            uint256 edge = 10 * cap;
-            uint256 half = cap * 40_000 / 22_000;
+            uint256 edge = 100 * cap;
+            uint256 near = (cap * 1_200_000 + 1_194_059) / 1_194_060;
             console2.log("(A3) week / cap (IMD)", w, cap / 1e18);
-            console2.log("    edge escrow / fee (IMD x 1e-3)", edge / 1e18, (edge * 50 / 10_000) / 1e15);
-            console2.log("    half-band escrow / fee (IMD x 1e-3)", half / 1e18, (half * 50 / 10_000) / 1e15);
+            console2.log("    passive edge escrow / fee (IMD x 1e-3)", edge / 1e18, (edge * 50 / 10_000) / 1e15);
+            console2.log("    passive one-bucket escrow / fee (IMD x 1e-3)", near / 1e18, (near * 50 / 10_000) / 1e15);
+            console2.log("    marketable escrow / fee (IMD x 1e-3)", cap / 1e18, (cap * 50 / 10_000) / 1e15);
         }
     }
 

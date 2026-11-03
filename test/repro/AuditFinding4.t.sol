@@ -16,7 +16,7 @@ contract AuditFinding4Test is ReproBase {
     function _ticket(Mkt memory m) internal {
         pl = _player(m, "player", 100e18, 0);
         _at(D, 1 hours);
-        id = _orderAs(m, pl, 2 * D, true, -60, 1e18);
+        id = _orderAs(m, pl, 2 * D, true, -60, 5e18);
         guess = _guessOf(0);
         vm.prank(pl);
         m.game.commit(id, _commitOf(guess, SALT, pl, D + 1));

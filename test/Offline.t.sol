@@ -9,10 +9,12 @@ import {Suite} from "./Suite.sol";
 import {Stateful} from "./Stateful.sol";
 import {StandInIntake, StandInBurnExecutor, StandInLaunchFees} from "./StandIns.sol";
 import {RingerUnit} from "./RingerUnit.sol";
+import {RingerPrice} from "./RingerPrice.sol";
 import {RingerStateful} from "./RingerStateful.sol";
 import {AuditFixes} from "./AuditFixes.sol";
 import {FeeRootAndCap} from "./FeeRootAndCap.sol";
 import {ResidualCap} from "./ResidualCap.sol";
+import {AuditTwoFixes} from "./AuditTwoFixes.sol";
 
 /// The offline environment: a local PoolManager, a stand-in IMD, a stand-in burn executor, a stand-in fee setting and
 /// a stand-in Intake. Run with `forge test`; no network is needed.
@@ -65,3 +67,9 @@ contract DevResidualCapTest is ResidualCap, DevEnv {
         super.setUp();
     }
 }
+
+/// The design rules behind the second audit's fixes, beyond its reproduction tests (test/audit-two).
+contract DevAuditTwoFixesTest is AuditTwoFixes, DevEnv {}
+
+/// The ring reward's price, the lower of the spot and the last ring's read (the ringer alone, mocks).
+contract DevRingerPriceTest is RingerPrice {}

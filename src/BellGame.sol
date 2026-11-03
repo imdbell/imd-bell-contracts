@@ -17,13 +17,13 @@ interface IHookForGame {
 }
 
 /// @title Guess the Bell
-/// @notice Every order of a day earns one sealed guess at the next day's opening price. Guesses are committed before the
-///         16:00 close and revealed after the open settles. The three closest distances score 3, 2 and 1 points; the
-///         game pays points, never money, and holds no tokens at all.
+/// @notice A wallet seals at most one guess a day at the next day's opening price, on one of its orders of that day.
+///         Guesses are committed before the 16:00 close and revealed after the open settles. The three closest
+///         distances score 3, 2 and 1 points; the game pays points, never money, and holds no tokens at all.
 /// @dev Ownerless; the one reference is immutable. The game scores the settled open, not the bell: the bucket nearest the
 ///      mean of the per-block checkpoints in the thirty minutes from the bell's own time, which the hook freezes so the
 ///      caller of `settle` cannot choose the window, and which nobody may read before it has ended. A ticket ranks only
-///      if its order paid for it (a fill of at least the smallest order, or a cancel or unfilled-order fee).
+///      if its order earned it (the hook's ticketPaid: at least 5 IMD, kept in its book through a bell that rang).
 contract BellGame {
     error NotYourOrder();
     error TicketUsed();
@@ -35,11 +35,11 @@ contract BellGame {
     error RevealClosed();
     error NoCommit();
     error BadReveal();
-    error AlreadyRevealed();
     error TicketUnpaid();
     error NotFinal();
     error NoPoints();
     error AlreadyTallied();
+    error OneGuessPerDay();
 
     event Committed(uint256 indexed day, address indexed who, uint256 indexed orderId);
     event Settled(uint256 indexed day, int24 scored, bool fromMean, bool windowFrozen);
@@ -84,6 +84,11 @@ contract BellGame {
     /// @notice Sealed guesses by the day of the bell they guess and the order that earned the ticket.
     mapping(uint256 day => mapping(uint256 orderId => bytes32)) public commits;
     mapping(uint256 orderId => bool) public ticketUsed;
+    /// @dev The day of the bell each wallet last sealed a guess for. One guess a wallet a day, so no wallet can seal a
+    ///      guess at every bucket and reveal, once the answer is public, the one that matches. A wallet's guessed days
+    ///      only rise: the commits for a day close at 16:00 the day before, before any book whose tickets guess the
+    ///      day after can open, so equality with the last one is the whole check. Committed(day, wallet) records it.
+    mapping(address => uint256) internal lastGuessDay;
     mapping(uint256 day => mapping(address => bool)) public revealed;
     mapping(uint256 day => mapping(address => uint32)) public distOf;
     mapping(uint256 day => mapping(address => bool)) public tallied;
@@ -96,14 +101,17 @@ contract BellGame {
     }
 
     // ── tickets and sealing ──
-    /// @notice Seals a guess for the opening bell after the day of `orderId`'s book, before 16:00 of that day.
-    ///         `c = keccak256(abi.encode(guess, salt, owner, day))`, with `guess = bucket + OFFSET`.
+    /// @notice Seals a guess for the opening bell after the day of `orderId`'s book, before 16:00 of that day; once per
+    ///         wallet and day, whichever of its orders it uses. `c = keccak256(abi.encode(guess, salt, owner, day))`, with
+    ///         `guess = bucket + OFFSET`. The guess counts only if the order earns its ticket (see the hook's ticketPaid).
     function commit(uint256 orderId, bytes32 c) external {
         (address owner, uint256 s,,,) = hook.orderInfo(orderId);
         if (owner != msg.sender) revert NotYourOrder();
         uint256 ticketDay = s / 2;
         if (block.timestamp >= ticketDay * 1 days + CLOSE_BELL) revert CommitsClosed();
         if (ticketUsed[orderId]) revert TicketUsed();
+        if (lastGuessDay[msg.sender] == ticketDay + 1) revert OneGuessPerDay();
+        lastGuessDay[msg.sender] = ticketDay + 1;
         ticketUsed[orderId] = true;
         commits[ticketDay + 1][orderId] = c;
         emit Committed(ticketDay + 1, msg.sender, orderId);
@@ -141,9 +149,9 @@ contract BellGame {
         emit Settled(day, scored, n > 0, frozen);
     }
 
-    /// @notice Reveals a sealed guess for today's bell after it settled and before 16:00. Each wallet reveals once per
-    ///         day: the guess it reveals is the one that ranks, so a wallet holding several tickets reveals its best. A
-    ///         ticket whose order did not pay for it is refused and the wallet may reveal another.
+    /// @notice Reveals the wallet's sealed guess for today's bell after it settled and before 16:00. A wallet seals one
+    ///         guess a day, so it has one to reveal (its commit is deleted here, so a second reveal finds none); a
+    ///         ticket whose order did not earn it is refused.
     function reveal(uint256 orderId, uint256 guess, bytes32 salt) external {
         uint256 day = block.timestamp / 1 days;
         DayState storage ds = dayState[day];
@@ -152,7 +160,6 @@ contract BellGame {
         bytes32 c = commits[day][orderId];
         if (c == 0) revert NoCommit();
         if (keccak256(abi.encode(guess, salt, msg.sender, day)) != c) revert BadReveal();
-        if (revealed[day][msg.sender]) revert AlreadyRevealed();
         if (!hook.ticketPaid(orderId)) revert TicketUnpaid();
         delete commits[day][orderId];
         revealed[day][msg.sender] = true;

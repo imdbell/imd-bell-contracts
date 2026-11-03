@@ -146,6 +146,7 @@ contract RingerHandler is Test {
         ++rings;
         uint256 paid;
         bool seen;
+        bool purseSkipped;
         for (uint256 i; i < lg.length; ++i) {
             if (lg[i].emitter != address(r)) continue;
             if (lg[i].topics[0] == BellRinger.Rewarded.selector) {
@@ -154,10 +155,15 @@ contract RingerHandler is Test {
                 seen = true;
             } else if (lg[i].topics[0] == BellRinger.ChoreSkipped.selector) {
                 ++choresSkipped;
+                if (uint256(lg[i].topics[1]) == 4) purseSkipped = true;
             }
         }
         assertTrue(seen, "ringing: Rewarded on every ring");
-        uint256 inflow = open && feedWorks ? feed0 : 0;
+        // the purse chore's inflow counts only if the chore ran: a well-behaved mock can still starve at its stipend
+        // when every slot it touches is cold (forge's isolated calls start each call cold), and then the feed stays in
+        // the mock hook, which the next assertion checks
+        uint256 inflow = open && feedWorks && !purseSkipped ? feed0 : 0;
+        if (open && purseSkipped) assertEq(hook.purseFeed(), feed0, "ringer purse: a skipped purse chore moved the feed");
         assertLe(paid, r.RING_REWARD_CAP(), "ringer purse: over the cap");
         assertLe(paid, held0 + inflow, "ringer purse: over the purse");
         assertEq(imd.balanceOf(c) >= paid, true);

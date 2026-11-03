@@ -16,8 +16,8 @@ contract AuditFinding3Test is ReproBase {
         _at(D, 1 hours);
         assertEq(m.hook.depositCap(), 1_000e18, "precondition: launch-week cap");
         id = _orderAs(m, occ, 2 * D, true, -12_000, 1_000e18);
-        // the decided cap counts an order at the band's edge at a tenth (1,000 IMD -> 100)
-        assertEq(m.hook.bookImdTotal(2 * D), 100e18, "precondition: the one order counts a tenth of its size");
+        // the decided cap counts a passive order at the band's edge at 1 % (1,000 IMD -> 10)
+        assertEq(m.hook.bookImdTotal(2 * D), 10e18, "precondition: the one order counts 1 % of its size");
     }
 
     function test_F3_honestBuyJoinsAfterFarOrder() public {
@@ -41,12 +41,12 @@ contract AuditFinding3Test is ReproBase {
     /// CONTROL: without the occupier (and with one that leaves 1 IMD of room) the honest order goes in.
     function test_F3_control_roomLeftHonestJoins() public {
         Mkt memory m = mkt;
-        // 998 IMD of counted room at the band's edge takes ten times that in escrow
-        occ = _player(m, "occupier", 10_000e18, 0);
+        // 998 IMD of counted room at the band's edge takes a hundred times that in escrow (a passive buy)
+        occ = _player(m, "occupier", 100_000e18, 0);
         hon = _player(m, "honest", 100e18, 100e18);
         _at(D, 1 hours);
         _orderAs(m, hon, 2 * D, true, 0, 1e18);
-        _orderAs(m, occ, 2 * D, true, -12_000, 9_980e18);
+        _orderAs(m, occ, 2 * D, true, -12_000, 99_800e18);
         _orderAs(m, hon, 2 * D, false, 0, 1e18);
         assertEq(m.hook.bookImdTotal(2 * D), 1_000e18);
     }
@@ -72,10 +72,10 @@ contract AuditFinding3Test is ReproBase {
         _at(D, OPEN - 600 - 3600 - 60); // 10:49
         vm.prank(occ);
         m.hook.cancelOrder(id);
-        // refilling the counted cap at the band's edge takes ten times the cap in escrow
-        _fundImd(occ, 9_000e18);
-        _orderAs(m, occ, 2 * D, true, -12_000, 9_950e18);
-        _orderAs(m, occ, 2 * D, true, -12_000, 50e18);
+        // refilling the counted cap with a passive order at the band's edge takes a hundred times the cap in escrow
+        _fundImd(occ, 99_100e18);
+        _orderAs(m, occ, 2 * D, true, -12_000, 99_500e18);
+        _orderAs(m, occ, 2 * D, true, -12_000, 500e18);
         _at(D, OPEN - 600 - 60); // 11:49, inside the no-cancel hour
         vm.prank(hon);
         (bool ok, bytes memory e) =

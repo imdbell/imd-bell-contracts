@@ -198,7 +198,9 @@ abstract contract Game is Invariants {
         _at(D, CLOSE - 1);
         vm.prank(a);
         m.game.commit(id1, _commitOf(_guessOf(0), salt, a, D + 1));
+        // one guess a wallet a day: its second order of the day seals nothing
         vm.prank(a);
+        vm.expectRevert(BellGame.OneGuessPerDay.selector);
         m.game.commit(id2, _commitOf(_guessOf(60), salt, a, D + 1));
         // one ticket per order
         vm.prank(a);
@@ -231,13 +233,16 @@ abstract contract Game is Invariants {
         vm.prank(a);
         vm.expectRevert(BellGame.BadReveal.selector);
         m.game.reveal(id1, _guessOf(60), salt);
-        // the right reveal ranks; a second reveal by the same wallet the same day is refused
+        // the right reveal ranks; the wallet sealed one guess, so after its reveal it has none left
         vm.prank(a);
         m.game.reveal(id1, _guessOf(0), salt);
         (, uint32 c1) = m.game.rankOf(D + 1, 0);
         assertEq(c1, 1, "the wallet ranks once");
         vm.prank(a);
-        vm.expectRevert(BellGame.AlreadyRevealed.selector);
+        vm.expectRevert(BellGame.NoCommit.selector);
+        m.game.reveal(id1, _guessOf(0), salt);
+        vm.prank(a);
+        vm.expectRevert(BellGame.NoCommit.selector);
         m.game.reveal(id2, _guessOf(60), salt);
         (, uint32 c2) = m.game.rankOf(D + 1, 1);
         assertEq(c2, 0, "a wallet never ranks twice");
@@ -423,31 +428,34 @@ abstract contract Game is Invariants {
     }
 
     // ── what pays for a ticket ──
-    /// A ticket ranks only if its order paid for it. Five orders, five answers: a fill of at least 0.5 IMD (paid); a
-    /// cancel (paid, the cancel fee); a bucket the bell did not reach (paid, the unfilled-order fee at claim, whether or
-    /// not it has been claimed yet); a fill below 0.5 IMD with no fee (unpaid); an order of a bell that never rang,
-    /// refunded whole (unpaid). An unpaid ticket's reveal is refused and changes nothing.
+    /// A ticket ranks only if its order earned it: at least 5 IMD at its book's reference, kept in its book through a
+    /// bell that rang. Then whatever the bell did: a fill (paid); a bucket the bell did not reach (paid, whether or not
+    /// it has been claimed); a rationed order that filled under 0.5 IMD with no fee (paid). Never: a cancel, however
+    /// large; an order under 5 IMD, even one that pays the unfilled-order fee; an order of a bell that never rang.
     function test_G_ticketPaidRule() public {
         Mkt memory m = mkt;
         address a = _player(m, "a", 1_000e18, 1_000e18);
         _at(D, 1 hours);
         uint256 filled = _orderAs(m, a, 2 * D, true, 60, 10e18);
-        uint256 cancelled = _orderAs(m, a, 2 * D, true, -600, 1e18);
-        uint256 notReached = _orderAs(m, a, 2 * D, true, -1200, 1e18);
+        uint256 cancelled = _orderAs(m, a, 2 * D, true, -600, 10e18);
+        uint256 notReached = _orderAs(m, a, 2 * D, true, -1200, 5e18);
+        uint256 small = _orderAs(m, a, 2 * D, true, -1200, 4.99e18);
         vm.prank(a);
         m.hook.cancelOrder(cancelled);
         // the only sell: 10.3 coin at -60, so the buy at 60 fills about 10 IMD and P* = -60
         _order(m, 2 * D, false, -60, 10.3e18);
         assertFalse(m.hook.ticketPaid(filled), "before the bell nothing has filled");
-        assertTrue(m.hook.ticketPaid(cancelled), "a cancelled order paid the cancel fee");
+        assertFalse(m.hook.ticketPaid(cancelled), "a cancelled order never earns a ticket");
         _at(D, OPEN);
         _nextBlock();
         m.hook.ringOpen();
-        assertTrue(m.hook.ticketPaid(filled), "a fill of at least 0.5 IMD pays for the ticket");
-        assertTrue(m.hook.ticketPaid(notReached), "an order the bell did not reach pays the fee at claim, claimed or not");
+        assertTrue(m.hook.ticketPaid(filled), "a 10 IMD order that filled earned its ticket");
+        assertTrue(m.hook.ticketPaid(notReached), "a 5 IMD order the bell did not reach earned its ticket, claimed or not");
+        assertFalse(m.hook.ticketPaid(small), "under 5 IMD: no ticket, though it pays the unfilled-order fee");
+        assertFalse(m.hook.ticketPaid(cancelled), "a cancelled order never earns a ticket, after the bell too");
         // a fill below 0.5 IMD: D's closing book, two 10 IMD buys at the reference against one 0.6-coin sell (the
         // smallest sell worth 0.5 IMD, split two ways); the buys are the marginal heavy side, each fills about 0.3 IMD
-        // and its remainder comes back whole
+        // and its remainder comes back whole: rationed, and 10 IMD, so it earned its ticket
         _at(D, OPEN + 10 minutes);
         int24 ref = m.hook.referenceOf(2 * D + 1);
         uint256 tiny = _orderAs(m, a, 2 * D + 1, true, ref, 10e18);
@@ -458,7 +466,7 @@ abstract contract Game is Invariants {
         m.hook.ringClose();
         (int24 pc,,,,,) = m.hook.bells(2 * D + 1);
         assertEq(pc, ref, "precondition: the close cleared at the reference");
-        assertFalse(m.hook.ticketPaid(tiny), "a fill below 0.5 IMD with no fee does not pay for a ticket");
+        assertTrue(m.hook.ticketPaid(tiny), "a rationed 10 IMD order earned its ticket, however little it filled");
         // an order of a bell that never rang: book 2(D+1), whose open nobody rings
         _at(D, 18 hours);
         uint256 unrung = _orderAs(m, a, 2 * (D + 1), true, 0, 10e18);
@@ -470,12 +478,14 @@ abstract contract Game is Invariants {
         // the claims do not change the answers
         m.hook.claim(notReached);
         m.hook.claim(tiny);
+        m.hook.claim(small);
         assertTrue(m.hook.ticketPaid(notReached), "claimed: still paid");
-        assertFalse(m.hook.ticketPaid(tiny), "claimed: still unpaid");
+        assertTrue(m.hook.ticketPaid(tiny), "claimed: still paid");
+        assertFalse(m.hook.ticketPaid(small), "claimed: still unpaid");
     }
 
-    /// The reveal path: a wallet whose first ticket is unpaid is refused without spending its one reveal, and reveals
-    /// its paid ticket instead.
+    /// The reveal path: a wallet whose one sealed guess rides on an order that did not earn its ticket (under 5 IMD) is
+    /// refused at reveal, and cannot fall back on another order: it sealed its one guess of the day.
     function test_G_unpaidTicketDoesNotRank() public {
         Mkt memory m = mkt;
         address a = _player(m, "a", 1_000e18, 1_000e18);
@@ -485,15 +495,17 @@ abstract contract Game is Invariants {
         _at(D, OPEN);
         _nextBlock();
         m.hook.ringOpen();
-        // the unpaid ticket: a closing-book buy at the reference that fills about 0.3 IMD (two buys share 0.6 coin)
+        // the unpaid ticket: a closing-book buy of 4 IMD at the reference that fills about 0.3 IMD (two buys share 0.6
+        // coin); under 5 IMD, so whatever it fills it earns no ticket
         _at(D, OPEN + 10 minutes);
         int24 ref = m.hook.referenceOf(2 * D + 1);
-        uint256 tiny = _orderAs(m, a, 2 * D + 1, true, ref, 10e18);
-        _order(m, 2 * D + 1, true, ref, 10e18);
+        uint256 tiny = _orderAs(m, a, 2 * D + 1, true, ref, 4e18);
+        _order(m, 2 * D + 1, true, ref, 4e18);
         _order(m, 2 * D + 1, false, ref, 0.6e18);
         bytes32 salt = keccak256("s");
         vm.startPrank(a);
         m.game.commit(tiny, _commitOf(_guessOf(0), salt, a, D + 1));
+        vm.expectRevert(BellGame.OneGuessPerDay.selector);
         m.game.commit(paid, _commitOf(_guessOf(600), salt, a, D + 1));
         vm.stopPrank();
         _at(D, CLOSE);
@@ -507,12 +519,13 @@ abstract contract Game is Invariants {
         vm.prank(a);
         vm.expectRevert(BellGame.TicketUnpaid.selector);
         m.game.reveal(tiny, _guessOf(0), salt);
-        assertFalse(m.game.revealed(D + 1, a), "the refused reveal did not spend the wallet's reveal");
+        assertFalse(m.game.revealed(D + 1, a), "the refused reveal changed nothing");
         (, uint32 c0) = m.game.rankOf(D + 1, 0);
         assertEq(c0, 0, "nothing ranked");
         vm.prank(a);
+        vm.expectRevert(BellGame.NoCommit.selector);
         m.game.reveal(paid, _guessOf(600), salt);
         (, uint32 c1) = m.game.rankOf(D + 1, 0);
-        assertEq(c1, 1, "the paid ticket ranks");
+        assertEq(c1, 0, "and the order it did not seal cannot stand in");
     }
 }

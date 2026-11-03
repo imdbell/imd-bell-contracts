@@ -97,8 +97,11 @@ contract MarketHoursHook is IUnlockCallback {
     uint256 internal constant BELL_FEE_BPS = 125;
     uint256 internal constant CANCEL_FEE_BPS = 50;
     uint256 internal constant EXIT_PENALTY_BPS = 500;
-    /// @dev The smallest order, in IMD at the book's reference; one order of at least this earns one guess ticket.
+    /// @dev The smallest order, in IMD at the book's reference.
     uint256 internal constant MIN_ORDER = 0.5e18;
+    /// @dev The smallest order that earns a guess ticket, in IMD at the book's reference (a buy's escrow, a sell's coin
+    ///      valued there): ten times the smallest order, so a ticket stands behind a real stake, not dust.
+    uint256 internal constant TICKET_MIN = 5e18;
     uint256 internal constant MIN_BURN = 5e18;
     /// @dev The smallest coin burn, so each burn is worth its gas.
     uint256 internal constant MIN_COIN_BURN = 100_000e18;
@@ -188,6 +191,8 @@ contract MarketHoursHook is IUnlockCallback {
         bool buy;
         bool claimed;
         bool cancelled;
+        /// @dev worth at least TICKET_MIN when placed, at the book's reference (which moves once its bell rings)
+        bool ticket;
         int24 bucket;
         uint256 amount;
     }
@@ -252,7 +257,8 @@ contract MarketHoursHook is IUnlockCallback {
     mapping(uint256 => Order) public orders;
     mapping(uint256 => mapping(int24 => uint256)) public buyImd;
     mapping(uint256 => mapping(int24 => uint256)) public sellTok;
-    /// @notice Per book, the orders' counted amounts (IMD weighted by distance from the reference) against the cap.
+    /// @notice Per book, the orders' counted amounts against the cap: IMD in full for a marketable order, weighted by
+    ///         distance from the reference for a passive one.
     mapping(uint256 => uint256) public bookImdTotal;
     /// @dev What each order counted toward its book's cap when placed; a cancel takes back exactly this.
     mapping(uint256 => uint256) internal countedOf;
@@ -331,13 +337,18 @@ contract MarketHoursHook is IUnlockCallback {
         if (bucket % TS != 0 || bucket > ref + BAND * TS || bucket < ref - BAND * TS) revert BadBucket();
         uint256 imdValue = buy ? amount : _coinToImd(amount, _sqrtAt(ref));
         if (imdValue < MIN_ORDER) revert BelowMinOrder();
-        // the cap counts an order by its distance from the reference: in full at it, falling linearly to a tenth at the
-        // band's edge, (40,000 - 3 x |bucket - ref|) / 40,000 with the distance in ticks (12,000 at the edge), so one far
-        // order that will not trade cannot fill the book
-        uint256 counted;
+        // the cap counts a marketable order (a buy at or above the reference, a sell at or below it) in full: that is
+        // volume the bell can clear, so the cap bounds it as stated. A passive order counts by its distance, falling
+        // linearly from full at the reference to 1 % at the band's edge, (1,200,000 - 99 x d) / 1,200,000 with d the
+        // distance in ticks (12,000 at the edge), so an order far below a buyer's or above a seller's price weighs
+        // little: one at the edge must escrow a hundred times what it counts.
+        uint256 counted = imdValue;
         unchecked {
-            // |bucket - ref| <= 12,000 after the band check: no wrap
-            counted = imdValue * (40_000 - 3 * uint256(int256(bucket > ref ? bucket - ref : ref - bucket))) / 40_000;
+            // d: how far a passive order sits from the reference, in ticks (zero or less for a marketable one); |d| <=
+            // 12,000 after the band check, and imdValue is escrow the hook pulls, far below 2^256 / 1.2e6: no wrap
+            int256 d = int256(bucket - ref);
+            if (buy) d = -d;
+            if (d > 0) counted = imdValue * (1_200_000 - 99 * uint256(d)) / 1_200_000;
         }
         uint256 total = bookImdTotal[s] + counted;
         if (total > depositCap()) revert BookFull();
@@ -349,7 +360,7 @@ contract MarketHoursHook is IUnlockCallback {
         if (buy) buyImd[s][bucket] += _net(amount);
         else sellTok[s][bucket] += amount;
         orderId = nextOrderId++;
-        orders[orderId] = Order(msg.sender, uint40(s), buy, false, false, bucket, amount);
+        orders[orderId] = Order(msg.sender, uint40(s), buy, false, false, imdValue >= TICKET_MIN, bucket, amount);
         countedOf[orderId] = counted;
         emit OrderPlaced(orderId, msg.sender, s, buy, bucket, amount);
     }
@@ -386,7 +397,7 @@ contract MarketHoursHook is IUnlockCallback {
         if (!bells[s].rung && block.timestamp < (s / 2) * 1 days + (s & 1 == 0 ? CLOSE_BELL : CLOSE_DEADLINE)) {
             revert NotClaimable();
         }
-        (uint256 out, uint256 refund, uint256 fee, uint256 unfilledFee,) = _outcome(o);
+        (uint256 out, uint256 refund, uint256 fee, uint256 unfilledFee) = _outcome(o);
         if (fee > 0) _splitFee(orderId, fee);
         if (unfilledFee > 0) {
             if (o.buy) burnAccrued += unfilledFee;
@@ -400,8 +411,8 @@ contract MarketHoursHook is IUnlockCallback {
     }
 
     /// @dev What a claim of `o` pays and charges, read from its bell alone, so a view gives the same answer before the
-    ///      claim as the claim itself: `out` and `refund` to the owner, the bell fee, the unfilled-order fee and the IMD
-    ///      worth of what filled. An unrung bell refunds the whole escrow. After a rung bell every unfilled part of an
+    ///      claim as the claim itself: `out` and `refund` to the owner, the bell fee and the unfilled-order fee. An
+    ///      unrung bell refunds the whole escrow. After a rung bell every unfilled part of an
     ///      order pays the cancel fee, rounded up, in its own currency: all of an order the bell did not reach, and what
     ///      neither the book nor the pool filled of one it did reach (a one-sided or zero-match book included). The one
     ///      exception is the marginal bucket's pro-rata remainder: an order at P* on the heavier side, when the book
@@ -411,13 +422,13 @@ contract MarketHoursHook is IUnlockCallback {
     function _outcome(Order memory o)
         internal
         view
-        returns (uint256 out, uint256 refund, uint256 fee, uint256 unfilledFee, bool paid)
+        returns (uint256 out, uint256 refund, uint256 fee, uint256 unfilledFee)
     {
         uint256 s = o.s;
         Bell memory bl = bells[s];
         uint256 a = o.amount;
         refund = a;
-        if (!bl.rung) return (0, a, 0, 0, false);
+        if (!bl.rung) return (0, a, 0, 0);
         if (o.buy ? o.bucket >= bl.pStar : o.bucket <= bl.pStar) {
             uint160 sp = _sqrtAt(bl.pStar);
             bool rationed; // the marginal bucket's pro-rata remainder, exempt from the unfilled-order fee
@@ -429,7 +440,6 @@ contract MarketHoursHook is IUnlockCallback {
             uint256 bookOut = net;
             uint256 resIn;
             uint256 resOut;
-            uint256 filledImd;
             if (o.buy == bl.buyHeavy) {
                 Charge memory ch = charges[s];
                 bool marg = o.bucket == bl.pStar;
@@ -452,12 +462,10 @@ contract MarketHoursHook is IUnlockCallback {
                 fee = _divUp(bookIn * BELL_FEE_BPS, 10_000);
                 out = _imdToCoin(bookOut, sp) + _imdToCoin(resOut, sp);
                 refund -= fee;
-                filledImd = bookIn + resIn;
             } else {
                 uint256 gross = _coinToImd(bookOut, sp);
                 fee = _divUp(gross * BELL_FEE_BPS, 10_000);
                 out = gross - fee + _coinToImd(resOut, sp);
-                filledImd = _coinToImd(bookIn + resIn, sp);
             }
             if (!rationed && bookIn + resIn < net) {
                 // the unfilled share of the escrow; capped by the refund, so a wei-sized base cannot underflow it
@@ -465,14 +473,9 @@ contract MarketHoursHook is IUnlockCallback {
                 if (unfilledFee > refund) unfilledFee = refund;
                 refund -= unfilledFee;
             }
-            // the ticket: paid by the unfilled-order fee, by a fill of at least the smallest order, or by filling whole
-            // whatever the order's size (a buy's whole fill is its net, below MIN_ORDER for the smallest buys); a buy
-            // and a sell alike
-            paid = unfilledFee > 0 || filledImd >= MIN_ORDER || bookIn + resIn >= net;
         } else {
             unfilledFee = _divUp(a * CANCEL_FEE_BPS, 10_000);
             refund = a - unfilledFee;
-            paid = true; // the unfilled-order fee
         }
     }
 
@@ -532,16 +535,13 @@ contract MarketHoursHook is IUnlockCallback {
         return (o.owner, o.s, o.buy, o.bucket, o.amount);
     }
 
-    /// @notice Whether `orderId` paid for its guess ticket: it was cancelled (and paid the cancel fee), or its bell rang
-    ///         and it filled whole (whatever its size), filled at least the smallest order's worth in IMD, or its claim
-    ///         charges the unfilled-order fee (whenever it is made). Read from the order and its bell, never from
-    ///         whether the claim has happened yet.
+    /// @notice Whether `orderId` earned its guess ticket: it was worth at least 5 IMD at its book's reference when placed,
+    ///         it stayed in its book through the bell (a cancelled order never earns one), and its bell rang; then it
+    ///         has, whatever the bell did with it: filled, rationed, or charged the unfilled-order fee. Read from the
+    ///         order and its bell, never from whether the claim has happened yet.
     function ticketPaid(uint256 orderId) external view returns (bool) {
         Order memory o = orders[orderId];
-        if (o.cancelled) return true;
-        if (!bells[o.s].rung) return false;
-        (,,,, bool paid) = _outcome(o);
-        return paid;
+        return o.ticket && !o.cancelled && bells[o.s].rung;
     }
 
     /// @notice Today's settle window: the frozen counters once a checkpoint has frozen them, the live counters until
@@ -637,6 +637,9 @@ contract MarketHoursHook is IUnlockCallback {
     ///      only the pool's own refusal inside it (see unlockCallback) leaves a residual unfilled: any other failure, out
     ///      of gas included, reverts the bell, so a bell never goes final with its residual dropped.
     function _ring(uint256 s) internal {
+        // no bell before the pool has a price, as no order and no cancel: a bell rung first would spend the day's
+        // opening on an empty book, and the first book would open without one
+        if (!initialized) revert NotEnterable();
         Bell storage bl = bells[s];
         if (bl.rung) revert BellAlreadyRung();
         // rung from inside somebody else's unlock, a bell could not run its residual, and a swap after it in that same
@@ -995,7 +998,7 @@ contract MarketHoursHook is IUnlockCallback {
     }
 
     /// @dev The gate, then the three anti-bot checks in order: size cap, price breaker, round trip.
-    function beforeSwap(address, PoolKey calldata, IPoolManager.SwapParams calldata p, bytes calldata)
+    function beforeSwap(address sender, PoolKey calldata, IPoolManager.SwapParams calldata p, bytes calldata)
         external
         returns (bytes4, BeforeSwapDelta, uint24)
     {
@@ -1007,7 +1010,7 @@ contract MarketHoursHook is IUnlockCallback {
         (uint160 sp, int24 tick,,) = manager.getSlot0(PoolId.wrap(poolId));
         _sizeCap(p.zeroForOne, p.amountSpecified, sp);
         _breaker(sp, tick);
-        _roundTrip(p.zeroForOne);
+        _roundTrip(sender, p.zeroForOne);
         return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
@@ -1051,12 +1054,21 @@ contract MarketHoursHook is IUnlockCallback {
         window = w;
     }
 
-    /// @dev Round trip: one direction per transaction signer per block (a speed bump, not a wall). The identity is the
-    ///      signer, tx.origin, whatever the router: a router that reports the signer through msgSender() resolved to it
-    ///      before, and one that does not was keyed on the router itself, which coupled every user of that router. No
-    ///      router can spend somebody else's direction, since it cannot sign for them.
-    function _roundTrip(bool zeroForOne) internal {
+    /// @dev Round trip: one direction per identity per block (a speed bump, not a wall). The identity is the one the
+    ///      router reports through msgSender() whenever it answers with an address, and the transaction's signer when it
+    ///      does not. Keyed on the signer alone, every account behind one bundler or relayer shared one direction; keyed
+    ///      on a router that reports nothing, every user of that router did. A router can spend only the direction of
+    ///      an identity it reports, and only for this block. A zero answer (a router at rest) is no identity.
+    function _roundTrip(address sender, bool zeroForOne) internal {
         address id = tx.origin;
+        assembly ("memory-safe") {
+            // msgSender(); at most one word comes back into scratch space, so no reply can cost the swap more memory
+            mstore(0, shl(224, 0xd737d0c7))
+            if and(staticcall(gas(), sender, 0, 4, 0, 32), gt(returndatasize(), 31)) {
+                let w := mload(0)
+                if and(iszero(shr(160, w)), iszero(iszero(w))) { id := w }
+            }
+        }
         uint256 dir = zeroForOne ? 1 : 0;
         uint256 last = lastSwap[id];
         if (last >> 1 == block.number && last & 1 != dir) revert RoundTrip();

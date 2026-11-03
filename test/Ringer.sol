@@ -274,9 +274,22 @@ abstract contract Ringer is Gas {
 
     // ── the reward read back and recomputed; OVERHEAD covers what the in-call count cannot see ──
     /// The counted gas is read back from the event (reward = 1.5 x gas x (base fee + allowance) x IMD per ETH, at 1 gwei); a real
-    /// transaction costs its caller 21,064 (intrinsic and the four calldata bytes) plus the call's own gas, which is
-    /// the test frame's figure less the cold account access the frame adds (2,600). OVERHEAD must cover the gap.
+    /// transaction costs its caller 21,064 (intrinsic and the four calldata bytes) plus the call's own gas. Without
+    /// isolation the call's own gas is the test frame's figure less the cold account access the frame adds (2,600).
+    /// With isolation (forge 1.8's default) every top-level call runs as its own transaction, cold, and the frame's
+    /// figure already holds the 21,064: then the frame is the transaction's cost. OVERHEAD must cover the gap.
+    function isolationProbe() external {}
+
+    /// whether this run isolates top-level calls: an empty external call costs the frame the intrinsic gas then
+    function _isolated() internal returns (bool) {
+        uint256 g = gasleft();
+        this.isolationProbe();
+        return g - gasleft() > 21_000;
+    }
+
     function test_R_rewardRecomputedAndOverheadCovers() public {
+        bool iso = _isolated();
+        console2.log("(R) top-level calls isolated (1 = yes)", iso ? 1 : 0);
         Mkt memory m = mkt;
         BellRinger r = _ringer(m);
         _topUp(m, 30e18);
@@ -295,7 +308,7 @@ abstract contract Ringer is Gas {
             Rung memory o = _ringVia(m, fresh, RING_GAS_T);
             assertLt(o.paid, r.RING_REWARD_CAP(), "precondition: under the cap, so the count can be read back");
             uint256 counted = (o.paid << 96) / priceX96 * 2 / 3 / 1 gwei;
-            uint256 txCost = 21_064 + o.frame - 2_600;
+            uint256 txCost = iso ? o.frame : 21_064 + o.frame - 2_600;
             console2.log(open ? "(R) open: counted (incl. OVERHEAD) / tx cost / frame" : "(R) close: counted (incl. OVERHEAD) / tx cost / frame", counted, txCost, o.frame);
             console2.log("    OVERHEAD needed / set", txCost - (counted - r.OVERHEAD()), r.OVERHEAD());
             assertGe(counted + 1, txCost, "the reward covers the whole transaction's gas");

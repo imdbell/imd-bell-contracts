@@ -17,8 +17,9 @@ interface IRingerToken {
 
 /// @title The bell ringer: whoever rings a bell first is paid from the bell purse
 /// @notice `ring()` rings whichever bell the clock says is due, runs that bell's chores, then pays the caller the ring's
-///         gas at the base fee plus a fixed tip allowance, half again, in IMD at the ETH/IMD pool's price (nothing if
-///         that price cannot be read), at most 3 IMD and at most what the purse holds. An empty purse pays nothing and the bell still rings. A chore that fails
+///         gas at the base fee plus a fixed tip allowance, half again, in IMD at the ETH/IMD pool's price (the lower of
+///         its spot now and at the last ring; nothing if it cannot be read), at most 3 IMD and at most what the purse
+///         holds. An empty purse pays nothing and the bell still rings. A chore that fails
 ///         is skipped and never stops the bell or the reward. `pushBurnRewarded()` does the same for the hook's burn, at
 ///         most 0.5 IMD, and only when the burn crossed the bridge. Anyone may top the purse up.
 /// @dev Created by the hook in its constructor, so every reference here is fixed by that one deployment. Nobody owns it;
@@ -65,8 +66,11 @@ contract BellRinger {
     uint256 public constant CHORE_GAS_CLOSE = GAS_SETTLE + GAS_NIGHT;
 
     // The gas a ring or a push costs its caller that the in-call count cannot see: the transaction's own 21,000 and
-    // calldata, the dispatch before the count starts, and the price read, payment and event after it ends.
-    uint256 public constant OVERHEAD = 60_000;
+    // calldata, the dispatch before the count starts, and the price read, the stored price's write, payment and event
+    // after it ends. A ring's is the most a ring was measured to leave uncounted, cold and isolated as a transaction
+    // (82,961, the first priced ring, whose price write fills an empty slot; 63,080 later), plus 10 %, rounded up to
+    // 5,000.
+    uint256 public constant OVERHEAD = 95_000;
     uint256 public constant PUSH_OVERHEAD = 60_000;
 
     /// @notice The priority fee per gas the reward allows on top of the base fee. The reward follows the base fee, which
@@ -97,6 +101,9 @@ contract BellRinger {
     /// @dev The last bell (its book: 2 x day for the open, 2 x day + 1 for the close) whose chores ran here. `ring()`
     ///      only ever serves the bell due now, so one word does the work of a flag per bell.
     uint256 internal choresDone;
+    /// @dev The ETH/IMD sqrt price the last priced ring read, for the next reward (see _reward). Zero until a ring has
+    ///      read one.
+    uint256 internal lastSqrtPrice;
 
     constructor(
         address hook_,
@@ -186,7 +193,7 @@ contract BellRinger {
             _chore(6, game, abi.encodeWithSelector(0x8df82800, d), GAS_SETTLE); // settle(uint256)
             _chore(7, swarmBudget, abi.encodeWithSelector(0x01e20f20, d + 1), GAS_NIGHT); // requestNight(uint256)
         }
-        uint256 paid = _payOut(_reward(gasStart - gasleft() + OVERHEAD, 0, RING_REWARD_CAP));
+        uint256 paid = _payOut(_reward(gasStart - gasleft(), 0, true));
         emit Rewarded(msg.sender, paid, open);
     }
 
@@ -206,7 +213,7 @@ contract BellRinger {
         // the cost includes the bridge fee: the ETH the push kept
         if (bridged) {
             uint256 kept = back < msg.value ? msg.value - back : 0;
-            paid = _payOut(_reward(gasStart - gasleft() + PUSH_OVERHEAD, kept, PUSH_REWARD_CAP));
+            paid = _payOut(_reward(gasStart - gasleft(), kept, false));
         }
         if (back > 0) {
             (bool sent,) = msg.sender.call{value: back}("");
@@ -243,11 +250,18 @@ contract BellRinger {
         if (!ok) emit ChoreSkipped(id, reason);
     }
 
-    /// @dev min(cap, 1.5 x (gasUsed x (basefee + TIP_ALLOWANCE) + extraWei) in IMD at the pool's spot). The spot is
-    ///      sqrtP^2 / 2^192 IMD per ETH. A failed, zero or out-of-range read pays nothing, with `NoPrice`: without a
+    /// @dev min(cap, 1.5 x ((gasUsed + overhead) x (basefee + TIP_ALLOWANCE) + extraWei) in IMD at the price), with the
+    ///      ring's overhead and cap for a ring (`store`), the push's for a push: one body for both, so the two callers
+    ///      share it whole. gasUsed is the in-call count; the overhead is what it cannot see. The price is the lower
+    ///      of the pool's spot now and the spot the last priced ring stored, sqrtP^2 / 2^192 IMD per ETH: a ringer can
+    ///      move the spot inside its own transaction, but not what a ring before it read, so it cannot raise its own
+    ///      reward that way. A ring (`store`) stores its own read for the next one; a push prices the same way and
+    ///      stores nothing. The first ring has no stored price and uses the spot alone (bounded by the cap). A failed,
+    ///      zero or out-of-range read pays nothing, with `NoPrice`, and leaves the stored price as it was: without a
     ///      price there is no reward, never the cap. A cost too large to price safely pays the cap.
-    function _reward(uint256 gasUsed, uint256 extraWei, uint256 cap) internal returns (uint256) {
-        uint256 costWei = gasUsed * (block.basefee + TIP_ALLOWANCE) + extraWei;
+    function _reward(uint256 gasUsed, uint256 extraWei, bool store) internal returns (uint256) {
+        uint256 cap = store ? RING_REWARD_CAP : PUSH_REWARD_CAP;
+        uint256 costWei = (gasUsed + (store ? OVERHEAD : PUSH_OVERHEAD)) * (block.basefee + TIP_ALLOWANCE) + extraWei;
         address mgr = manager;
         bytes32 slot = priceSlot;
         bool ok;
@@ -262,6 +276,12 @@ contract BellRinger {
         if (sp == 0 || sp >> 128 != 0) {
             emit NoPrice();
             return 0;
+        }
+        uint256 last = lastSqrtPrice;
+        if (store) lastSqrtPrice = sp;
+        unchecked {
+            // the lower of the two; zero stored (no ring before) wraps to the top and leaves the spot
+            if (last - 1 < sp) sp = last;
         }
         if (costWei >> 95 != 0) return cap;
         uint256 r = (costWei * 3 / 2) * (sp * sp >> 96) >> 96;

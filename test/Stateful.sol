@@ -77,6 +77,8 @@ contract Handler is Test {
     }
 
     Sealed[] public sealedGuesses;
+    /// the day each wallet last sealed a guess for, as the game must keep it (one guess a wallet a day)
+    mapping(address => uint256) internal lastGuessOf;
     bytes32 public lastGuessId;
     bytes32 public lastReportId;
     uint256 public lastNight;
@@ -639,10 +641,12 @@ contract Handler is Test {
         int24 g = hook.referenceOf(s) + int24(bound(off, -20, 20)) * 60;
         uint256 guess = uint256(int256(g) + 887_280);
         bytes32 salt = keccak256(abi.encode(id, off, block.timestamp));
-        bool allowed = block.timestamp < (day - 1) * 1 days + CLOSE && !game.ticketUsed(id);
+        bool allowed = block.timestamp < (day - 1) * 1 days + CLOSE && !game.ticketUsed(id) && lastGuessOf[owner] != day;
         vm.prank(owner);
         try game.commit(id, keccak256(abi.encode(guess, salt, owner, day))) {
-            assertTrue(allowed, "sealing: a commit was taken at or after 16:00 of the ticket's day, or a ticket was used twice");
+            assertTrue(allowed, "sealing: a commit was taken at or after 16:00 of the ticket's day, a ticket twice, or a wallet's second guess of a day");
+            assertGt(day, lastGuessOf[owner], "sealing: a wallet's guessed days only rise");
+            lastGuessOf[owner] = day;
             sealedGuesses.push(Sealed(owner, id, day, guess, salt, false));
         } catch {
             assertFalse(allowed, "a commit that should have been taken was refused");
