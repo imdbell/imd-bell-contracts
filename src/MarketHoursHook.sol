@@ -266,7 +266,10 @@ contract MarketHoursHook is IUnlockCallback {
     mapping(uint256 => Charge) public charges;
     Checkpoint public checkpoint;
     Window public window;
-    mapping(address => uint256) public lastSwap;
+    /// @notice The round-trip guard's record per identity: the block of its last swap, shifted left one, plus the
+    ///         direction (1 = zeroForOne). The identity is the signer's address as a padded word when the router
+    ///         reports nothing, else the hash of the router and the address it reports (see _roundTrip).
+    mapping(bytes32 => uint256) public lastSwap;
 
     uint256 public burnAccrued;
     uint256 public coinBurnAccrued;
@@ -610,14 +613,11 @@ contract MarketHoursHook is IUnlockCallback {
             Checkpoint memory cp = checkpoint;
             r.a = lastCleared;
             if (cp.tickCount > 0 || cp.sqrtPriceX96 != 0) {
-                int256 t = cp.tickCount > 0
-                    ? int256(cp.tickSum) / int256(uint256(cp.tickCount))
-                    : int256(TickMath.getTickAtSqrtPrice(cp.sqrtPriceX96));
-                // held where its whole band is a valid price (the grid's last bucket is 887,220), so the next book and its
-                // bell can always be priced
-                if (t > 875_220) t = 875_220;
-                if (t < -875_220) t = -875_220;
-                r.a = _nearestBucket(imdIs0 ? -t : t);
+                r.a = _heldBucket(
+                    cp.tickCount > 0
+                        ? int256(cp.tickSum) / int256(uint256(cp.tickCount))
+                        : int256(TickMath.getTickAtSqrtPrice(cp.sqrtPriceX96))
+                );
             }
         }
         if (best == 0) {
@@ -992,8 +992,7 @@ contract MarketHoursHook is IUnlockCallback {
         if (initialized) revert AlreadyInitialized();
         if (PoolId.unwrap(PoolIdLibrary.toId(key)) != poolId) revert BadPool();
         initialized = true;
-        int24 tick = TickMath.getTickAtSqrtPrice(sqrtPriceX96);
-        lastCleared = _nearestBucket(imdIs0 ? -int256(tick) : int256(tick));
+        lastCleared = _heldBucket(TickMath.getTickAtSqrtPrice(sqrtPriceX96));
         return IHooks.beforeInitialize.selector;
     }
 
@@ -1027,9 +1026,22 @@ contract MarketHoursHook is IUnlockCallback {
 
     /// @dev Breaker: the block's first swap checkpoints spot; a later one may not start more than X from it. The first
     ///      swap of a block also feeds the counters, and the first one at or after the settle window's end freezes it.
+    ///      A swap that starts where nothing is in range is at a price nobody can trade at (a dust sell pushes the price
+    ///      off the seed's low edge for free, as far as the tick range goes): it is neither sampled nor the block's
+    ///      checkpoint, and the block's first swap that starts inside liquidity is. The pool's in-range liquidity is
+    ///      the fourth word of its state in the manager (the pools mapping, slot 6, at the pool's id), read from the
+    ///      manager as its own state library reads it, only on the block's first swap.
     function _breaker(uint160 sp, int24 tick) internal {
         Checkpoint memory cp = checkpoint;
         if (cp.blockNumber != uint32(block.number)) {
+            bytes32 pid = poolId;
+            bytes32 liqSlot;
+            assembly ("memory-safe") {
+                mstore(0, pid)
+                mstore(32, 6)
+                liqSlot := add(keccak256(0, 64), 3)
+            }
+            if (_managerWord(0x1e2eaeaf, liqSlot) == 0) return;
             _windowCheckpoint(cp);
             cp.blockNumber = uint32(block.number);
             cp.sqrtPriceX96 = sp;
@@ -1055,24 +1067,46 @@ contract MarketHoursHook is IUnlockCallback {
     }
 
     /// @dev Round trip: one direction per identity per block (a speed bump, not a wall). The identity is the one the
-    ///      router reports through msgSender() whenever it answers with an address, and the transaction's signer when it
-    ///      does not. Keyed on the signer alone, every account behind one bundler or relayer shared one direction; keyed
-    ///      on a router that reports nothing, every user of that router did. A router can spend only the direction of
-    ///      an identity it reports, and only for this block. A zero answer (a router at rest) is no identity.
+    ///      router reports through msgSender() whenever it answers with an address, scoped to that router: the key is
+    ///      the hash of the router and the address it reports. When the router does not answer, the key is the
+    ///      transaction's signer, as a padded word (its top 96 bits are zero, which no hash key has). Keyed on the signer
+    ///      alone, every account behind one bundler or relayer shared one direction; keyed on a router that reports
+    ///      nothing, every user of that router did; keyed on the reported address alone, any contract could report
+    ///      somebody else's address and spend their direction for the block. A router can spend only the direction of
+    ///      an identity it reports, in its own namespace, and only for this block. A zero answer (a router at rest), a
+    ///      reply shorter than a word, or a word with bits above the address is no identity.
     function _roundTrip(address sender, bool zeroForOne) internal {
-        address id = tx.origin;
+        bytes32 id = bytes32(uint256(uint160(tx.origin)));
         assembly ("memory-safe") {
-            // msgSender(); at most one word comes back into scratch space, so no reply can cost the swap more memory
+            // msgSender(); at most one word comes back into scratch space, so no reply can cost the swap more memory.
+            // The call stands in its own statement: and() evaluates its arguments right to left, so a returndatasize()
+            // inside it would be read before the call and measure the previous call's reply, not this one's
             mstore(0, shl(224, 0xd737d0c7))
-            if and(staticcall(gas(), sender, 0, 4, 0, 32), gt(returndatasize(), 31)) {
+            let ok := staticcall(gas(), sender, 0, 4, 0, 32)
+            if and(ok, gt(returndatasize(), 31)) {
                 let w := mload(0)
-                if and(iszero(shr(160, w)), iszero(iszero(w))) { id := w }
+                if and(iszero(shr(160, w)), iszero(iszero(w))) {
+                    // keccak256(abi.encode(sender, reported)): the router's word, then the reported address's
+                    mstore(0x20, w)
+                    mstore(0, sender)
+                    id := keccak256(0, 0x40)
+                }
             }
         }
         uint256 dir = zeroForOne ? 1 : 0;
         uint256 last = lastSwap[id];
         if (last >> 1 == block.number && last & 1 != dir) revert RoundTrip();
         lastSwap[id] = (block.number << 1) | dir;
+    }
+
+    /// @dev A pool tick as a book's reference: held where its whole band is a valid price (the grid's last bucket is
+    ///      887,220, a band 200 buckets each way), so the book and its bell can always be priced and no bucket past the
+    ///      grid enters a band; then in IMD-per-coin terms, as the nearest bucket. The same hold for the reference set at
+    ///      initialisation and for the one each bell reads from the pool.
+    function _heldBucket(int256 t) internal view returns (int24) {
+        if (t > 875_220) t = 875_220;
+        if (t < -875_220) t = -875_220;
+        return _nearestBucket(imdIs0 ? -t : t);
     }
 
     /// @dev Nearest bucket on the 60-tick grid; an exact half rounds to the lower bucket.

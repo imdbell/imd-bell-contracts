@@ -15,12 +15,33 @@ before it rings (`GasShort`).
 
 | File | What it is |
 |---|---|
-| `MarketHoursHook.sol` | The Uniswap v4 hook: the order books, the two bells, the session rules and the fee shares. Nobody owns it and nothing in it can be changed after deployment. At deployment it creates `BellGame`, `BellRinger` and `SwarmBudget`. |
+| `MarketHoursHook.sol` | The Uniswap v4 hook: the order books, the two bells, the session rules and the fee shares. Nobody owns it and nothing in it can be changed after deployment. At deployment it creates `BellGame`, `BellRinger` and `SwarmBudget`. Its round-trip guard allows one swap direction per identity per block; `lastSwap(bytes32)` holds the record, keyed on the transaction's signer as a padded word, or, when the router reports an account through `msgSender()`, on the hash of that router and that account. |
 | `MarketHoursCoin.sol` | A plain ERC-20 with a fixed supply minted once at deployment; anyone may burn their own coin. |
-| `BellGame.sol` | The guessing game: sealed guesses (one per wallet per day, each on an order of at least 5 IMD kept in its book through the bell), reveals after the open settles, ranks and points. It holds no tokens. |
+| `BellGame.sol` | The guessing game: sealed guesses (one per wallet per day, each on an order of at least 5 IMD kept in its book through the bell), reveals after the open settles, ranks and points. A revealed guess must be a bucket, on the 60-tick grid and no higher than the grid's top word; any other guess cannot be revealed. It holds no tokens. |
 | `BellRinger.sol` | Rings whichever bell is due, runs that bell's chores, and pays the caller from the bell purse. |
 | `SwarmBudget.sol` | A small purse that can only pay for two nightly requests to the network's Intake: a guess at the next open and a short report on the day. |
 | `IIntake.sol` | The part of the network's Intake interface that `SwarmBudget` calls. |
+
+## Since the third audit
+
+Commit 4eb95e3 was audited in the public audit job d2e99057-f18f-44d5-852b-53d5bb1b4ca0. This commit answers its
+seven findings:
+
+- Finding 1: no contract change; accepted, see "Known and accepted" (the ring reward after a moved ring).
+- Finding 2, `MarketHoursHook`: the round-trip guard's key is scoped to the router that reports it. When the router
+  reports an account through `msgSender()`, the key is `keccak256(abi.encode(router, account))`; otherwise it is the
+  transaction's signer as a padded word. The public record is `lastSwap(bytes32)`, which takes that key. A router can
+  spend only the direction of an account it reports itself.
+- Finding 3, `BellGame`: `reveal` refuses a guess that is not a bucket, off the 60-tick grid or above the grid's top
+  word (`BadReveal`). An off-grid committer has spent the day's guess and reveals nothing.
+- Finding 4, `MarketHoursHook`: a swap that starts where the pool has no liquidity in range is neither sampled nor the
+  block's checkpoint; the block's first swap that starts inside liquidity is.
+- Finding 5, `MarketHoursHook`: the reference set when the pool is initialised is held to ±875,220 and taken as the
+  nearest bucket, exactly as each bell's reference is, so the first bell rings from any initial price and no bucket
+  past the grid's last one enters a band.
+- Finding 6, `MarketHoursHook`: the reply-length check in the round-trip guard reads the length of the router's own
+  reply, so a reply shorter than a word is no identity and the signer is keyed.
+- Finding 7: no contract change; accepted, see "Known and accepted" (a guess ticket at the band's passive edge).
 
 ## Since the second audit
 
@@ -71,6 +92,27 @@ Residual cap, `MarketHoursHook`: a bell's residual swap stops 120 buckets from t
 clearing price's fee-inward limit, whichever is nearer. What the cap leaves unfilled comes back without the
 unfilled-order fee. This bounds the gas a bell can need.
 
+## Known and accepted
+
+**The ring reward after a moved ring.** The ringer prices its reward at the lower of the ETH/IMD pool's spot and the
+spot the previous ring stored, and it stores the raw spot its own transaction read. A ring made with the pool moved
+the same way twice running is therefore paid at the moved price on the second, up to the 3 IMD cap; the first moved
+ring is paid the honest stored price. This is accepted: moving the pool and moving it back inside one transaction
+costs the mover the pool's 1 % fee on both legs, and nobody can trade between the two legs. Pushing the stored spot
+down instead, so that the next honest ring is paid almost nothing, costs the mover the same fee on both legs. The
+worst case is bounded: the purse pays at most the two ring caps and the push caps in a day, and the bells still ring,
+because the reward is a bonus on a ring anyone can make. After a bell has been rung straight at the hook, the
+ringer's own call runs without the hook's unlock guard, so the move, the ring and the restore can share one pool
+unlock and settle net: the mover then needs the fee, not capital. No change; `test/RingerPrice.sol` keeps the
+two-rings test and `test/audit-three/AuditThreeFinding1.t.sol` pins the accepted behaviour.
+
+**A guess ticket at the band's passive edge.** A 5 IMD buy at the far passive edge of the book's band is never
+reached by the bell, so at claim it pays only the 0.5 % unfilled-order fee, 0.025 IMD, and holds a paid guess ticket;
+it counts 1 % of its value, 0.05 IMD, toward the deposit cap. Covering the 41 buckets within 1,200 ticks of the
+reference this way costs about 1.025 IMD in fees plus gas, with 205 IMD held for a few hours, one fresh wallet per
+bucket. The game pays points only, and one wallet per bucket is the limit of any per-wallet rule. No change; the
+figures are pinned by `test/audit-three/AuditThreeFinding7.t.sol`.
+
 ## Build and test
 
 ```sh
@@ -81,8 +123,10 @@ forge test
 The tests run offline against a local PoolManager and stand-in contracts (`test/Offline.t.sol`); no RPC URL or key is
 needed. `test/repro/` holds one test file per finding of the first audit, and `test/audit-two/` one per finding of
 the second (findings 1 and 2 share a file, as do 6 and 7), each asserting the behaviour the audit report calls
-correct; for finding 6, that a settle at 12:30 opens the reveal window. `test/variants/` holds an earlier version of
-the hook, used only for a gas comparison.
+correct; for finding 6, that a settle at 12:30 opens the reveal window. `test/audit-three/` holds one per finding of
+the third (findings 2 and 6 share a file): findings 2 to 6 assert the behaviour the audit report calls correct, and
+the tests for findings 1 and 7, both accepted, pin the accepted behaviour, so they would fail if it changed.
+`test/variants/` holds an earlier version of the hook, used only for a gas comparison.
 
 Compiler settings are in `foundry.toml`: solc 0.8.26, via-IR, optimizer 50 runs, EVM version cancun, no metadata
 hash. The tests pass on Foundry (forge) 1.5.1 and 1.8.3, each with its default settings. Dependencies are vendored

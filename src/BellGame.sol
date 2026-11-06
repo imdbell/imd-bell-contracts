@@ -151,7 +151,8 @@ contract BellGame {
 
     /// @notice Reveals the wallet's sealed guess for today's bell after it settled and before 16:00. A wallet seals one
     ///         guess a day, so it has one to reveal (its commit is deleted here, so a second reveal finds none); a
-    ///         ticket whose order did not earn it is refused.
+    ///         ticket whose order did not earn it is refused, and so is a guess that is not a bucket (off the 60-tick
+    ///         grid, or above the grid's words): its committer spent the day's guess and reveals nothing.
     function reveal(uint256 orderId, uint256 guess, bytes32 salt) external {
         uint256 day = block.timestamp / 1 days;
         DayState storage ds = dayState[day];
@@ -160,6 +161,10 @@ contract BellGame {
         bytes32 c = commits[day][orderId];
         if (c == 0) revert NoCommit();
         if (keccak256(abi.encode(guess, salt, msg.sender, day)) != c) revert BadReveal();
+        // a guess is a bucket: within the grid's words and on the 60-tick grid (OFFSET is itself on the grid, so the
+        // guess is on it exactly when the bucket is). Off the grid, the floored distance below would make one sealed
+        // guess an exact hit for two neighbouring buckets
+        if (guess > uint256(2 * OFFSET) || guess % 60 != 0) revert BadReveal();
         if (!hook.ticketPaid(orderId)) revert TicketUnpaid();
         delete commits[day][orderId];
         revealed[day][msg.sender] = true;

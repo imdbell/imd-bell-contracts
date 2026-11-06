@@ -77,18 +77,23 @@ abstract contract AuditFixes is GasOps {
     }
 
     // ── Audit finding 2: the reference is held where its whole band is a valid price ──
-    /// The harness pool has no liquidity below tick 0, so a dust sell in the session takes spot to the bottom of the tick
-    /// range; the next block's first swap (a dust buy, back into the seed) checkpoints that price. The open after the
-    /// night reads the last checkpoint's price (no swap since the close): the bottom of the range. Held to -875,220, the
-    /// next book's band is a valid price and its bell rings; unheld, the band would leave the tick range and no bell
+    /// A small IMD position sits at the bottom of the tick range, below the harness pool's seed. A dust sell in the
+    /// session falls through the empty range between them and lands inside that position; the next block's first swap
+    /// (a dust buy) starts inside liquidity there and checkpoints that price. (A swap that starts where nothing is in
+    /// range is not checkpointed, so the bottom must hold liquidity for a checkpoint to be taken there.) The open after
+    /// the night reads the last checkpoint's price (no swap since the close): the bottom of the range. Held to -875,220,
+    /// the next book's band is a valid price and its bell rings; unheld, the band would leave the tick range and no bell
     /// could ring again.
     function test_A2_referenceHeldInsideTheTickRange() public {
         Mkt memory m = mkt;
+        _fundImd(address(this), 1e18);
+        lp.modifyLiquidity(m.key, IPoolManager.ModifyLiquidityParams(-887_220, -880_020, 1e18, 0), "");
         _at(D, OPEN);
         m.hook.ringOpen();
         _nextBlock();
         _swap(m, false, 1e15);
         assertLt(_tick(m), -880_000, "precondition: the dust sell took spot to the bottom of the range");
+        assertGt(_liq(m), 0, "precondition: spot sits inside the bottom position");
         _nextBlock();
         _swap(m, true, 1e15);
         (, uint160 cpSp,,) = m.hook.checkpoint();
